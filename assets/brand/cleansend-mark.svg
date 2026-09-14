@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="CleanSend mark">
+  <title>CleanSend</title>
+  <mask id="cs-cut"><rect width="32" height="32" fill="#fff"/><path d="M9.2 16.6 14 21.4 23 11.6" fill="none" stroke="#000" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/></mask>
+  <path d="M17 2.5C25.2 2.5 30.2 8.2 29.6 16.6C29 25.2 22.4 30.2 14 29.6C6.2 29 1.8 23.2 2.4 15C3 7.4 8.8 2.5 17 2.5Z" fill="#1E4A3E" mask="url(#cs-cut)"/>
+</svg>

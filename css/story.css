@@ -1,0 +1,172 @@
+/* CleanSend — story.css (v5): the "chamber cinema" story engine.
+   Linked after site.css. Site.css still owns the section shell (.story,
+   .story-pin, .story-stage, .story-ui, .story-static + its fallback grid,
+   the is-static / html:not(.js) rules) — everything here is new engine UI
+   that lives inside those unchanged containers, namespaced `se-` so it can
+   never collide with the (now-unused-by-this-engine) v4 story-frame /
+   story-timer / story-caption rules also defined in site.css. */
+
+/* Section tone: --mineral at rest, darkens to match the baked studio-key
+   dip during arrive/close/hold, back to --mineral for the reveal. Set as an
+   inline background-color by story.js (a pure function of p); this is what
+   shows at the stage edges if the canvas/stills ever fail to fully cover it. */
+.story-stage { background: var(--mineral); z-index: 1; }
+/* the tone dim as a visible wash: object-fit:cover means the stage's own
+   background-color is never exposed (nothing ever letterboxes), so this
+   ::after — inside .story-stage's own stacking context, above the stills/
+   canvas but still beneath .story-ui (a separate, higher stacking context) —
+   is what actually shows the studio-key dip. Opacity is --tone-op, a pure
+   function of p set by story.js. */
+.story-stage::after {
+  content: ""; position: absolute; inset: 0; z-index: 4; pointer-events: none;
+  background: var(--tone-wash); opacity: calc(var(--tone-op, 0) * 0.10);
+}
+
+/* two full-bleed stills the canvas dissolves between; canvas sits on top */
+.se-still {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; object-position: 50% 52%;
+}
+.se-still--dirty { z-index: 3; opacity: 1; }
+.se-still--clean { z-index: 1; opacity: 1; }
+/* not-ready standby still (P1 fix): same layer as .se-canvas — the two are
+   mutually exclusive (engine-driven opacity), never both shown at once. */
+.se-still--mid { z-index: 2; opacity: 0; }
+.se-canvas { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; opacity: 0; display: block; }
+/* one-off 300ms cross-fade when the heavy assets finish loading and the
+   canvas takes over from whatever still was standing in for it — applied
+   only for that instant (js/story.js adds/removes the class), so it never
+   interferes with the continuous p-driven opacity elsewhere. */
+.se-canvas.is-revealing { transition: opacity 300ms ease; }
+
+/* Compact caption (team exception vs. the original v4-inherited sizing):
+   with the desktop cover focus at 50%/60%, the real chamber rect still comes
+   close to the caption's top edge in places, so the box itself is kept as
+   small as the copy allows — width capped at 380px/30%, tight padding, a
+   smaller two-line-max headline — rather than relying on focus alone. */
+.se-captions { position: absolute; left: var(--grid-gutter); bottom: 20px; width: min(380px, 30%); z-index: 4; pointer-events: none; }
+.se-caption {
+  position: absolute; left: 0; bottom: 0; width: 100%; opacity: 0;
+  background: rgba(247, 244, 236, 0.94); padding: 16px 20px;
+  border-radius: var(--radius-lg); box-shadow: 0 20px 50px rgba(13, 19, 33, 0.14);
+}
+.se-caption .eyebrow { color: var(--teal); }
+.se-line {
+  margin-top: var(--space-2); font-family: var(--font-display); font-weight: 800;
+  letter-spacing: -0.015em; line-height: 1.06; font-size: clamp(1.2rem, 0.8rem + 1vw, 1.7rem);
+  color: var(--teal-deep); text-wrap: balance;
+}
+/* one font step down (story.js applies this, measured per-viewport, when the
+   default compact size still wraps a caption tall enough to reach the real
+   chamber rect — confirmed to happen at 1280px specifically) */
+.se-captions--tight .se-line { font-size: clamp(1.05rem, 0.7rem + 0.9vw, 1.45rem); line-height: 1.04; }
+/* fallback (desktop only, set by story.js when even the compact box can't
+   clear the chamber at a given viewport width): dock under the header
+   instead of bottom-left. */
+.se-captions[data-pos="top"] { top: calc(69px + var(--space-4)); bottom: auto; }
+
+/* status rail: anchored to the right edge of the chamber rect (set as
+   percentages of the stage by story.js from manifest.chamber), vertically
+   centred on 55% of the chamber's height. Never covers the window. */
+.se-rail {
+  position: absolute; z-index: 4; opacity: 0; pointer-events: none;
+  left: calc(var(--chamber-left, 60%) + var(--chamber-width, 20%) + 1.4rem);
+  top: calc(var(--chamber-top, 30%) + var(--chamber-height, 30%) * 0.55);
+  transform: translateY(-50%);
+  display: flex; align-items: center; gap: var(--space-3);
+  background: rgba(247, 244, 236, 0.94); border-radius: var(--radius-lg);
+  padding: var(--space-3) var(--space-4); box-shadow: 0 16px 40px rgba(13, 19, 33, 0.16);
+  min-width: 200px; max-width: 300px; width: max-content;
+}
+.se-ring-wrap { position: relative; width: 52px; height: 52px; flex: none; opacity: 0; }
+.se-ring { width: 100%; height: 100%; transform: rotate(-90deg); }
+.se-ring-track { fill: none; stroke: rgba(30, 74, 62, 0.14); stroke-width: 4; }
+.se-ring-fill { fill: none; stroke: var(--signal); stroke-width: 4; stroke-linecap: round; stroke-dasharray: 175.9; stroke-dashoffset: 175.9; }
+/* Ring "breathe" (client round 2): stroke opacity 0.75-1.0, 1.6s sine, only
+   while locked and on screen — toggled by js/story.js (state.locked &&
+   sectionVisible); ready-gated too (js/story.js's updateUI returns before
+   reaching this class while !ready). */
+.se-ring-fill.is-breathing { animation: se-ring-breathe 1.6s ease-in-out infinite; }
+@keyframes se-ring-breathe { 0%, 100% { stroke-opacity: 0.75; } 50% { stroke-opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .se-ring-fill.is-breathing { animation: none; stroke-opacity: 1; }
+}
+.se-readout { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--font-display); font-weight: 800; font-size: 0.95rem; color: var(--teal-deep); letter-spacing: -0.01em; }
+.se-rail-text { min-width: 0; flex: 1 1 auto; }
+/* No white-space:nowrap: the normal cycle statuses ("Compartment 2",
+   "Locked - cycle running", etc.) all fit on one line at the rail's current
+   width regardless, but the P1 loading notice ("Loading the
+   demonstration...") is longer and needs to wrap rather than clip. */
+.se-status { font-size: var(--text-micro); font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--teal-deep); }
+.se-sub { margin-top: 2px; font-size: 0.7rem; color: var(--teal); }
+.se-unlock {
+  margin-top: var(--space-2); display: flex; align-items: center; gap: 6px;
+  font-size: 0.72rem; font-weight: 700; color: var(--teal-deep); opacity: 0;
+}
+.se-unlock svg { width: 14px; height: 14px; flex: none; }
+.se-lock { flex: none; width: 16px; height: 16px; color: var(--teal); opacity: 0.35; align-self: flex-start; transition: opacity 160ms cubic-bezier(0.16, 1, 0.3, 1); }
+.se-lock svg { width: 100%; height: 100%; }
+.se-lock.is-locked { opacity: 1; color: var(--teal-deep); }
+/* the shackle itself swings open (default, unlocked) and shut (.is-locked) —
+   pivoting on its right foot, matching a real padlock — rather than the
+   icon just changing opacity around one static closed shape. */
+.se-lock .shackle {
+  transform-origin: 11px 7px;
+  transform: rotate(-35deg) translate(-1px, -1.5px);
+  transition: transform 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.se-lock.is-locked .shackle { transform: rotate(0deg) translate(0, 0); }
+@media (prefers-reduced-motion: reduce) {
+  .se-lock .shackle, .se-lock { transition: none; }
+}
+
+/* reduced-motion / no-JS static fallback: the mid-cycle still gets a plain
+   timer badge (site.css owns figure/figcaption sizing; this only adds the
+   badge on top of the image within the same figure). */
+.story-static-mid { position: relative; }
+.se-static-timer {
+  position: absolute; top: var(--space-3); right: var(--space-3);
+  background: rgba(17, 48, 41, 0.82); color: var(--chalk);
+  font-family: var(--font-display); font-weight: 800; font-size: 0.9rem; letter-spacing: -0.01em;
+  padding: 4px 10px; border-radius: var(--radius-pill);
+}
+
+.se-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(30, 74, 62, 0.12); z-index: 5; }
+.se-progress-fill { height: 100%; background: var(--signal); transform-origin: left; transform: scaleX(0); }
+
+/* ---------------------------------------------------------------- phone */
+@media (max-width: 760px) {
+  /* Caption content at this width is fixed: two lines of eyebrow+headline,
+     measured at 96.8px (padding included); 112px gives it a small margin
+     without wasting space. The rail is a fixed 44px strip directly above it.
+     Everything else — the stage — gets the remaining height, bottom-anchored
+     against these two fixed-height footers so there is no dead pale area. */
+  .story[data-story] { --se-caption-h: 112px; --se-rail-h: 44px; }
+  .story-stage { top: 0; bottom: calc(var(--se-caption-h) + var(--se-rail-h)); }
+  .se-still, .se-canvas { object-position: 50% 55%; }
+  .se-captions {
+    position: absolute; left: 0; right: 0; bottom: 0; top: auto;
+    height: var(--se-caption-h); width: auto; z-index: 4;
+  }
+  .se-caption {
+    position: absolute; inset: 0; border-radius: 0; box-shadow: none;
+    padding: var(--space-3) var(--grid-gutter); background: var(--mineral);
+    display: flex; flex-direction: column; justify-content: center; height: 100%;
+  }
+  .se-line { font-size: 1.15rem; }
+  /* compact horizontal strip directly above the caption block (i.e. still
+     below the stage) — not anchored to the chamber rect: on phone the
+     chamber fills nearly the whole width per the manifest, so a floating
+     dock beside it would have nowhere to go */
+  .se-rail {
+    left: var(--grid-gutter); right: var(--grid-gutter);
+    top: auto; bottom: var(--se-caption-h); height: var(--se-rail-h);
+    transform: none; width: auto; min-width: 0; max-width: none;
+    padding: 0 var(--space-3); border-radius: 0; box-shadow: none;
+    background: var(--mineral);
+  }
+  .se-ring-wrap { width: 28px; height: 28px; }
+  .se-readout { font-size: 0.62rem; }
+  .se-status { font-size: 0.68rem; }
+  .se-sub, .se-unlock { display: none; }
+}

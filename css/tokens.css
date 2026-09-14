@@ -1,0 +1,114 @@
+/* CleanSend design tokens — palette, type scale, spacing, radius, motion.
+   Desktop-first: base rules target 1440, max-width media queries scale down.
+   See VISUAL-SYSTEM.md for rationale and measured contrast ratios. */
+
+:root {
+  /* ---- Palette (spec §1.1) ---- */
+  --chalk: #F7F4EC;
+  --mineral: #E8EEE9;
+  --mint: #D9F4E6;
+  --aqua: #AFE0CE;
+  --signal: #2EE59D;
+  --teal: #517664;
+  --teal-deep: #1E4A3E;
+  --teal-ink: #113029;
+  --ink: #0D1321;
+  --camel: #C59B76;
+  --camel-text: #8A5E3C;
+  --lavender: #A06B9A;
+  --lavender-text: #7A4E74;
+  --focus: #7A4E74;
+  --focus-dark: #C08FBC;
+
+  /* ---- Surfaces & text roles ---- */
+  --surface-page: var(--chalk);
+  --surface-alt: var(--mineral);
+  --surface-mint: var(--mint);
+  --surface-dark-event: var(--ink);
+  --surface-cta-block: var(--teal-ink);
+  --text-primary: var(--teal-deep);
+  --text-on-dark: var(--chalk);
+  --text-muted: var(--teal);
+
+  /* ---- Type families (css/fonts.css) ---- */
+  --font-display: "Bricolage Grotesque", "Familjen Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-body: "Archivo", ui-sans-serif, system-ui, sans-serif;
+
+  /* ---- Fluid type scale: clamp(mobile-390, fluid, desktop-1440) ---- */
+  --text-display-xl: clamp(2.5rem, 0.921rem + 6.476vw, 6.75rem);   /* 40px -> 108px, hero H1 */
+  --text-display-l:  clamp(2rem, 1.071rem + 3.81vw, 4.5rem);       /* 32px -> 72px, section H2 */
+  --text-display-m:  clamp(1.625rem, 1.207rem + 1.714vw, 2.75rem);/* 26px -> 44px, subheads */
+  --text-body-l:     clamp(1.0625rem, 0.993rem + 0.286vw, 1.25rem);/* 17px -> 20px */
+  --text-body:       clamp(1rem, 0.977rem + 0.095vw, 1.0625rem);  /* 16px -> 17px, default */
+  --text-small:      clamp(0.781rem, 0.770rem + 0.048vw, 0.8125rem);/* 12.5px -> 13px */
+  --text-micro:      clamp(0.6875rem, 0.664rem + 0.095vw, 0.75rem);/* 11px -> 12px, eyebrows/labels */
+  --text-timer:      clamp(4rem, 2.236rem + 7.238vw, 8.75rem);    /* 64px -> 140px, 4:52 numerals */
+
+  --leading-tight: 0.94;
+  --leading-snug: 1.14;
+  --leading-body: 1.55;
+  --tracking-tight: -0.02em;
+  --tracking-label: 0.14em;
+
+  /* ---- Spacing rhythm: 4px base, used for gaps, padding, margins ---- */
+  --space-1: 0.25rem;  /* 4px */
+  --space-2: 0.5rem;   /* 8px */
+  --space-3: 0.75rem;  /* 12px */
+  --space-4: 1rem;     /* 16px */
+  --space-5: 1.5rem;   /* 24px */
+  --space-6: 2rem;     /* 32px */
+  --space-7: 3rem;     /* 48px */
+  --space-8: 4rem;     /* 64px */
+  --space-9: 5rem;     /* 80px */
+  --space-10: 7.5rem;  /* 120px, desktop section padding */
+  --space-10-mobile: 4.5rem; /* 72px, mobile section padding */
+
+  /* ---- Grid ---- */
+  --grid-max: 1320px;
+  --grid-gutter: 3rem;      /* 48px desktop */
+  --grid-gutter-mobile: 1.375rem; /* 22px mobile */
+  --grid-columns: 12;
+
+  /* ---- Radius ---- */
+  --radius-sm: 3px;
+  --radius-md: 8px;
+  --radius-lg: 18px;
+  --radius-pill: 999px;
+
+  /* ---- Focus ring (spec §4 accessibility) ---- */
+  --focus-ring-width: 3px;
+  --focus-ring-offset: 3px;
+  --focus-ring-color: var(--focus);
+  --focus-ring-color-on-dark: var(--focus-dark);
+
+  /* ---- Motion ---- */
+  --duration-micro: 120ms;
+  --duration-fast: 200ms;
+  --duration-base: 360ms;
+  --duration-slow: 600ms;
+  --duration-story: 900ms;   /* scroll-tied narrative transitions, e.g. the ring fill */
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* ---- Story stage: contained-lighting wash behind the cleaning beat ---- */
+  --tone-wash: #12211c;
+  --ease-out-expo: cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+@media (max-width: 760px) {
+  :root {
+    --grid-gutter: var(--grid-gutter-mobile);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-micro: 0ms;
+    --duration-fast: 0ms;
+    --duration-base: 0ms;
+    --duration-slow: 0ms;
+    --duration-story: 0ms;
+  }
+}

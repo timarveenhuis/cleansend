@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="CleanSend mark">
+  <title>CleanSend mark</title>
+  <path d="M11 4.2 H21 C25.3 4.2 27.8 6.7 27.8 11 V21 C27.8 25.3 25.3 27.8 21 27.8 H11 C6.7 27.8 4.2 25.3 4.2 21 V11 C4.2 6.7 6.7 4.2 11 4.2 Z" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linejoin="round"/>
+  <path d="M9.8 16.6 L14 21 L22.4 11.2" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

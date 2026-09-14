@@ -1,0 +1,14 @@
+Fonts in this directory are distributed under the SIL Open Font License, Version 1.1.
+
+- Bricolage Grotesque (variable, weights 200-800), designed by Mathieu Triay,
+  distributed via Google Fonts. https://fonts.google.com/specimen/Bricolage+Grotesque
+- Archivo (variable, weights 100-900, subset served at 400/500/600/700),
+  designed by Omnibus-Type, distributed via Google Fonts.
+  https://fonts.google.com/specimen/Archivo
+
+Full license text: https://openfontlicense.org
+
+Copyright holders retain their rights per the OFL. These files are the
+unmodified latin-subset woff2 builds served by fonts.googleapis.com/css2 as of
+2026-09-10, self-hosted here so CleanSend does not depend on a third-party
+font CDN at runtime.
