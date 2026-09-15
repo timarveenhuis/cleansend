@@ -335,7 +335,7 @@
         </ul>
       </div>
       <div class="gym-cards">
-        <figure class="gym-card gym-card--controls" data-reveal>
+        <figure class="gym-card gym-card--controls" data-reveal aria-labelledby="gym-controls-caption">
           <div class="gym-explain-frame">
             <picture>
               <source type="image/avif" srcset="assets/img/controls-640.avif 640w, assets/img/controls-1280.avif 1280w" sizes="(max-width: 1194px) 100vw, 34vw">
@@ -351,14 +351,14 @@
             <span class="gym-dot" style="left:89.5%; top:23%;" aria-hidden="true">3</span>
             <span class="gym-leader" style="left:89.5%; top:30%; height:15%;" aria-hidden="true"></span>
           </div>
-          <ol class="gym-annot-labels" aria-labelledby="gym-controls-caption">
+          <ol class="gym-annot-labels" aria-label="Controls, numbered markers">
             <li>Contactless pad · €2</li>
             <li>Start button with status ring</li>
             <li>Lock indicator</li>
           </ol>
-          <figcaption id="gym-controls-caption">One pad. One button. One ring that tells you when it's done.</figcaption>
+          <figcaption id="gym-controls-caption" aria-hidden="true">One pad. One button. One ring that tells you when it's done.</figcaption>
         </figure>
-        <figure class="gym-card gym-card--explain" data-reveal>
+        <figure class="gym-card gym-card--explain" data-reveal aria-labelledby="gym-explain-caption">
           <div class="gym-explain-frame">
             <picture>
               <source type="image/avif" srcset="assets/img/explain-open-640.avif 640w, assets/img/explain-open-1280.avif 1280w, assets/img/explain-open-2048.avif 2048w" sizes="(max-width: 1194px) 100vw, 34vw">
@@ -371,14 +371,14 @@
             <span class="gym-dot" style="left:46.9%; top:54.9%;" aria-hidden="true">4</span>
             <span class="gym-dot" style="left:39.1%; top:63.7%;" aria-hidden="true">5</span>
           </div>
-          <ol class="gym-annot-labels" aria-labelledby="gym-explain-caption">
+          <ol class="gym-annot-labels" aria-label="Open compartment, numbered markers">
             <li>Smoked-glass door, locks while the cycle runs</li>
             <li>Contactless pad · €2</li>
             <li>UV diffuser strip</li>
             <li>Perforated rear grille, dry-air outlet</li>
             <li>Shelf, holds the pair</li>
           </ol>
-          <figcaption id="gym-explain-caption">Inside each compartment, as designed: UV light and dry air. Nothing else.</figcaption>
+          <figcaption id="gym-explain-caption" aria-hidden="true">Inside each compartment, as designed: UV light and dry air. Nothing else.</figcaption>
         </figure>
       </div>
     </div>
@@ -454,6 +454,7 @@
           <label class="visually-hidden" for="copy-fallback">Page link</label>
           <input type="text" id="copy-fallback" class="copy-fallback" readonly hidden>
           <p class="copy-status" aria-live="polite"></p>
+          <button type="button" class="btn-ghost start-over">Start over</button>
         </div>
 
         <details class="privacy-details" id="privacy">

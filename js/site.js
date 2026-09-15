@@ -114,6 +114,7 @@ function initForm() {
   const copyStatus = document.querySelector(".copy-status");
   const copyFallback = document.querySelector(".copy-fallback");
   const STORAGE_KEY = "cleansend.signup";
+  const startOverBtn = document.querySelector(".start-over");
   let submitting = false;
 
   function isValidEmail(v) {
@@ -123,6 +124,18 @@ function initForm() {
     errorEl.textContent = msg;
     emailInput.setAttribute("aria-invalid", "true");
     emailInput.focus();
+  }
+  function showSuccess({ focusHeading = true } = {}) {
+    form.classList.add("is-hidden");
+    successEl.classList.add("is-visible");
+    if (focusHeading) successEl.querySelector("h3")?.focus?.();
+  }
+  function showForm() {
+    successEl.classList.remove("is-visible");
+    form.classList.remove("is-hidden");
+    freqButtons.forEach((b) => b.setAttribute("aria-pressed", "false"));
+    freqThanks.textContent = "";
+    emailInput.value = "";
   }
 
   form.addEventListener("submit", (e) => {
@@ -143,9 +156,7 @@ function initForm() {
     }
     errorEl.textContent = "";
     emailInput.removeAttribute("aria-invalid");
-    form.classList.add("is-hidden");
-    successEl.classList.add("is-visible");
-    successEl.querySelector("h3")?.focus?.();
+    showSuccess();
   });
   emailInput.addEventListener("input", () => {
     if (emailInput.getAttribute("aria-invalid")) { emailInput.removeAttribute("aria-invalid"); errorEl.textContent = ""; }
@@ -168,6 +179,41 @@ function initForm() {
       freqThanks.textContent = saved ? `Noted: ${freq}. Saved in this browser only.` : `Noted: ${freq}. Couldn't save it in this browser.`;
     });
   });
+
+  if (startOverBtn) {
+    startOverBtn.addEventListener("click", () => {
+      try { window.localStorage.removeItem(STORAGE_KEY); } catch (err) { /* nothing more we can do; show the form regardless */ }
+      showForm();
+      emailInput.focus();
+    });
+  }
+
+  // Round 3, item 4: a previous submit persists to localStorage, but a
+  // reload always re-rendered the empty form — the copy says "saved in
+  // this browser only" but the UI didn't reflect that it actually was.
+  // On load, if a record with an email exists, render the success state
+  // (without stealing focus — that's for an actual submit action, not a
+  // page load) and restore the pressed frequency button if one was saved.
+  // Guard the read: a throwing localStorage (private-mode edge cases, some
+  // browser settings) must fall back to the ordinary empty-form state, not
+  // break the page.
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const record = raw ? JSON.parse(raw) : null;
+    if (record && record.email) {
+      showSuccess({ focusHeading: false });
+      if (record.frequency) {
+        freqButtons.forEach((b) => {
+          const match = b.textContent.trim() === record.frequency;
+          b.setAttribute("aria-pressed", match ? "true" : "false");
+        });
+        freqThanks.textContent = `Noted: ${record.frequency}. Saved in this browser only.`;
+      }
+    }
+  } catch (err) {
+    // localStorage threw on read (e.g. disabled/blocked storage) — leave
+    // the default empty-form state, which is already truthful.
+  }
 
   if (copyBtn) {
     const showFallback = () => {
