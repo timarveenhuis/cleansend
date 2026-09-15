@@ -561,7 +561,30 @@ html:not(.js) .story-stage, html:not(.js) .story-ui { display: none; }
 /* Story skip button — visible, keyboard-reachable, min 44x44 target,
    contrast >= 4.5:1 on the dark story-pin background in every state (F.). */
 .story-skip {
-  position: absolute; top: var(--space-4); right: var(--space-4); z-index: 6;
+  /* Round 4, item 1: `top: var(--space-4)` (16-24px) put this well UNDER
+     the fixed header at 1280x900 Chromium while pinned — the header's own
+     height (measured, ~70-90px depending on breakpoint) is always bigger
+     than --space-4, so the button sat behind the header's "Signup preview"
+     pill and intercepted no pointer events at all (element-from-point
+     resolved to the header). `--header-h` is already measured at runtime
+     and set on `.story-pin` (an ancestor of this button) by
+     js/story.js's measureHeaderHeight(), on load/resize/pin-toggle — the
+     same custom property css/story.css already uses for the caption
+     fallback position. Anchoring to it instead of a flat space token means
+     this can never land under the header at any viewport, measured not
+     assumed. */
+  position: absolute; top: calc(var(--header-h, 69px) + var(--space-4)); right: var(--space-4); z-index: 6;
+  /* Round 4, item 1 (second bug found alongside the header-overlap one):
+     `.story-ui` (the button's positioning ancestor) is `pointer-events:
+     none` so its children can be click-through by default — every other
+     interactive child in this section (`.ba-range` etc.) lives outside
+     `.story-ui`, so this button is the only one that needs its own
+     `pointer-events: auto` override, and it was missing entirely: clicks
+     passed straight through to whatever was painted underneath in
+     `.story-stage` regardless of z-index/position, confirmed directly via
+     `document.elementFromPoint()` resolving to `.se-still--dirty` instead
+     of the button even when the button visually sat on top. */
+  pointer-events: auto;
   min-width: 44px; min-height: 44px; padding: var(--space-2) var(--space-4);
   border-radius: var(--radius-pill); border: 1px solid rgba(247,244,236,0.55);
   /* I. contrast pass: this sits over the photographic stage, whose local
@@ -760,6 +783,27 @@ html:not(.js) .story-stage, html:not(.js) .story-ui { display: none; }
     position: static; width: auto; transform: none; text-align: left; padding: 0;
   }
   .safety-label::before { content: none; }
+}
+
+/* Round 4, item 2: same container-query failsafe extended to the gym
+   section — live QA reproduced clipped legend text ("UV diffuser strip" ->
+   "diffuse") at 200% zoom in both engines, same root cause as item 1 above
+   (the zoom/media-query desync means the real ≤1194px 1-column and ≤760px
+   1-column .gym-cards rules never engage under this technique even though
+   the container is genuinely squeezed). `.gym-card` has `overflow: hidden`
+   (site.css:382, clips its own rounded corners), so once the 2-column
+   `.gym-cards` grid is squeezed narrow enough that a legend item's text
+   can't fit AND (for a reason not fully isolated — possibly the fixed-
+   aspect-ratio image inside establishing a wide min-content floor on the
+   card's own track) doesn't wrap either, that overflow:hidden clips it
+   outright instead of wrapping — mirroring the real ≤1194px/≤760px
+   stacked layout removes the squeeze entirely. */
+.gym { container-type: inline-size; }
+@container (max-width: 1194px) {
+  .gym-layout { grid-template-columns: 1fr; gap: var(--space-7); }
+}
+@container (max-width: 761px) {
+  .gym-cards { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 760px) {

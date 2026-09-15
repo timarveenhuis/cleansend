@@ -687,13 +687,36 @@ export function initStory() {
   }
 
   // Zoom the sampled UV window around `focus` by `zoom` (>1 = visually
-  // zoomed in). Used only for the hold-only arrive degrade's scale settle,
-  // since a real arrive sequence already provides its own baked camera move.
+  // zoomed in). `focus` here is a fraction in SCREEN space (0-1, same
+  // convention as coverUvGl's own `focus` param: offset+screenUv*scale =
+  // textureUv), not texture-UV space.
   function zoomUv(scale, offset, focus, zoom) {
     const sx = scale[0] / zoom, sy = scale[1] / zoom;
     return {
       scale: [sx, sy],
       offset: [offset[0] + (scale[0] - sx) * focus.x, offset[1] + (scale[1] - sy) * focus.y],
+    };
+  }
+
+  // Round 4, item 3 (tightened in the addendum): convert a point derived
+  // from manifest.chamber's rect (texture-UV-fraction [x,y,w,h]) into the
+  // SCREEN-space focus fraction zoomUv expects, given the (pre-zoom) cover
+  // scale/offset already in effect — inverts offset+screenUv*scale=
+  // textureUv, i.e. screenUv=(textureUv-offset)/scale, clamped since the
+  // point can fall slightly outside the visible crop at some aspect ratios.
+  // `yBias` (0=chamber top edge, 0.5=chamber vertical centre) lets the
+  // caller pull the vertical anchor toward the TOP of the chamber: in
+  // zoomUv, a SMALLER focus.y produces a SMALLER new offset[1] (the crop
+  // window's top-of-texture edge), which keeps more of what's ABOVE the
+  // chamber (the cabinet top / logo band) and crops away more of what's
+  // BELOW it (the counter/floor) — exactly the direction needed to shrink
+  // the flat counter band without losing the cabinet top.
+  function chamberFocusFrac(chamber, scale, offset, yBias = 0.5) {
+    if (!chamber) return { x: 0.5, y: 0.5 };
+    const cx = chamber[0] + chamber[2] / 2, cy = chamber[1] + chamber[3] * yBias;
+    return {
+      x: clamp((cx - offset[0]) / scale[0], 0, 1),
+      y: clamp((cy - offset[1]) / scale[1], 0, 1),
     };
   }
 
@@ -775,7 +798,32 @@ export function initStory() {
         const idx = nearestProtected("arrive", state.frame, count);
         if (idx != null) {
           const bitmap = cache.get("arrive", idx);
-          const uv = uvFor(bitmap);
+          let uv = uvFor(bitmap);
+          // Phone camera only: the wide "p" arrive frame, cover-fit into a
+          // tall phone stage, leaves the machine small in the middle with a
+          // large plain counter band below it (live QA round 2, item 3).
+          // Digital-zoom in on the chamber during arrive — the baked camera
+          // is genuinely moving in over this segment, so a matching digital
+          // zoom on top of the real footage reads as coherent, not fake.
+          // t=0 (p at or before arriveStart, INCLUDING the whole
+          // dirty-dissolve segment so frame 0 never "pops" to a different
+          // zoom when arrive proper begins) -> 1.6x; eases smoothly (same
+          // smoothstep `range()` the hold-degrade above already uses) to
+          // 1.0x by arriveEnd. Desktop ("d" camera) is untouched — its own
+          // baked camera move already frames the chamber correctly.
+          // Addendum: an initial 1.4x centred on the chamber still left a
+          // ~36%-of-stage-height flat counter band below the cabinet
+          // (measured directly, after/F/phone-arrive-zoom/band.json) —
+          // raised to 1.6x AND biased the vertical focus up toward the
+          // chamber's own top edge (yBias 0.18, not 0.5/centre) so the
+          // extra zoom crops away more of the counter below the fascia
+          // than it crops off the cabinet top/logo above the compartments.
+          if (useP) {
+            const t = range(state.p, SEG.arriveStart, SEG.arriveEnd);
+            const zoom = lerp(1.6, 1.0, t);
+            const focus = chamberFocusFrac(dims.chamber, uv.scale, uv.offset, 0.18);
+            uv = zoomUv(uv.scale, uv.offset, focus, zoom);
+          }
           glCtx.drawFrame(glCtx.getFrameTexture(bitmap), uv.scale, uv.offset, [0.059, 0.106, 0.09]);
         } else if (holdReady) {
           // hold-only degrade: no arrive sequence yet (or it failed to load) —
