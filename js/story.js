@@ -30,56 +30,61 @@ const range = (p, a, b) => (a === b ? (p >= a ? 1 : 0) : smooth((p - a) / (b - a
 const linFrac = (p, a, b) => (a === b ? (p >= a ? 1 : 0) : clamp((p - a) / (b - a), 0, 1));
 
 // ---- storyboard constants (plans/DIRECTION-v5.md) --------------------------
+// F. (2026-09-15 quality pass): the pin was shortened from 5.5·vh to 4.0·vh,
+// and the hold ("cleaning") phase — previously 0.58 of total progress (0.32
+// to 0.90), 58% of the pin — is rebalanced down to 0.42 (42%, comfortably
+// under the ≤45% target) so scroll-through feels less like a long dead
+// zone. Every other boundary is scaled up proportionally within its own
+// side of the hold (pre-hold segments by k = (1-0.42)/(1-0.58) = 1.38095;
+// post-hold segments by the same k; hold-internal HOLD.* offsets rescaled
+// by 0.42/0.58 = 0.72414) so the *relative* pacing of dirty/arrive/close and
+// open/dissolve-out is unchanged — only the hold is compressed. See
+// REPORT-F.md for the full derivation and old->new boundary table.
 const SEG = {
-  dirtyEnd: 0.10,
+  dirtyEnd: 0.1381,
   // The 0.10-0.13 dissolve (dirty still -> arrive[0]) was checked against
   // the real arrive frames via gen/record-story.mjs's contact sheet and
   // found fighting, not reading as a cut-with-a-short-dissolve: the mat
   // close-up's shoe silhouette and the wide 3-compartment establishing shot
   // ghost through each other for a good third of the window (see f-011/
   // f-012 in screenshots/v5/motion/1440x900/). Shortened to 0.02 per the
-  // fallback instruction for exactly this case. arriveStart (0.13) is left
+  // fallback instruction for exactly this case. arriveStart is left
   // alone — that's the asset-timing boundary where arrive content itself
   // starts, not the dissolve's own visual duration.
-  dissolveInEnd: 0.12,
-  arriveStart: 0.13, arriveEnd: 0.26,
-  closeStart: 0.26, closeEnd: 0.32,
-  holdStart: 0.32, holdEnd: 0.90,
-  openStart: 0.90, openEnd: 0.95,
+  dissolveInEnd: 0.1657,
+  arriveStart: 0.1795, arriveEnd: 0.3590,
+  closeStart: 0.3590, closeEnd: 0.4419,
+  holdStart: 0.4419, holdEnd: 0.8619,
+  openStart: 0.8619, openEnd: 0.9310,
   // The p=0.90-1.0 reveal was found double-exposing two unrelated
   // compositions (the open-door chamber and the full mat reveal) cross-
-  // dissolved over the whole 0.95-1.0 tail — the same "fighting" failure
-  // mode as the 0.10-0.13 entry dissolve, just at the exit. Fix mirrors that
-  // one: open[dims.open-1] (openEnd is already reached at 0.95, so the
-  // canvas already just holds that frozen frame from there) stays fully
-  // opaque through 0.975, THEN a short 0.015-wide dissolve, landing on the
-  // clean still by 0.99 — a cut with a breath, not a long crossfade.
-  //
-  // First attempt used 0.965-0.98 with a check at p=0.972 — almost exactly
-  // that window's own midpoint, so of course it read as a ~50/50 double
-  // exposure in real Chrome; the check point has to sit OUTSIDE the
-  // dissolve window (before it starts / after it ends), not inside it.
-  dissolveOutStart: 0.975, dissolveOutEnd: 0.99,
+  // dissolved over the whole tail — the same "fighting" failure mode as the
+  // entry dissolve, just at the exit. Fix mirrors that one: open[dims.open-1]
+  // (openEnd is already reached by dissolveOutStart, so the canvas already
+  // just holds that frozen frame from there) stays fully opaque until
+  // dissolveOutStart, THEN a short dissolve, landing on the clean still by
+  // dissolveOutEnd — a cut with a breath, not a long crossfade.
+  dissolveOutStart: 0.9655, dissolveOutEnd: 0.9862,
 };
 const HOLD = {
-  lightUpEnd: 0.40,
-  cleanRampAEnd: 0.74, // c 0 -> 0.80
-  cleanRampBEnd: 0.84, // c 0.80 -> 1.0
-  lightDownStart: 0.84, lightDownEnd: 0.90,
-  mistInStart: 0.36, mistInEnd: 0.45,
-  mistFull: 0.65,
-  mistOutEnd: 0.82,
-  timerStart: 0.32, timerEnd: 0.86,
+  lightUpEnd: 0.4998,
+  cleanRampAEnd: 0.7460, // c 0 -> 0.80
+  cleanRampBEnd: 0.8185, // c 0.80 -> 1.0
+  lightDownStart: 0.8185, lightDownEnd: 0.8619,
+  mistInStart: 0.4709, mistInEnd: 0.5360,
+  mistFull: 0.6809,
+  mistOutEnd: 0.8040,
+  timerStart: 0.4419, timerEnd: 0.8329,
   // Working-light sweep (real Blender pack, round 3): the emissive band
   // travels left->right across the pair over the 24 frames and is already
   // dark at both frame 0 and frame 23 (a real render, not a synthetic
   // mask), so a plain wrap at the loop point is invisible — no separate
   // ease-in/out envelope needed on top; L alone (already ramping in/out at
-  // the edges of the hold) handles the fade. ~3 passes across p 0.32-0.86.
+  // the edges of the hold) handles the fade. ~3 passes across the hold.
   // Deterministic in p (floor(cycles*t*count) mod count — see
   // computeState) so scrubbing forward/backward reconstructs the identical
   // frame every time.
-  sweepStart: 0.32, sweepEnd: 0.86, sweepCycles: 3,
+  sweepStart: 0.4419, sweepEnd: 0.8329, sweepCycles: 3,
 };
 const TIMER_TOTAL_S = 4 * 60 + 52;
 // Per-segment scroll-to-frame index remap. `arrive`'s own baked camera move
@@ -283,7 +288,29 @@ export function initStory() {
   const unlockLine = root.querySelector("[data-unlock]");
   const statusEl = root.querySelector(".se-status");
   const progressFill = root.querySelector(".se-progress-fill");
+  const skipBtn = root.querySelector(".story-skip");
   if (!stage || !canvasEl) return;
+
+  // F. skip control: always wired (works before assets finish loading, and
+  // in the WebGL/2D fallback paths) — jumps past the pinned demonstration to
+  // #outcomes, respecting reduced-motion for the scroll itself.
+  if (skipBtn) {
+    skipBtn.addEventListener("click", () => {
+      const target = document.getElementById("outcomes");
+      if (!target) return;
+      const header = document.querySelector(".site-header");
+      const headerH = header ? header.getBoundingClientRect().height : 0;
+      const top = target.getBoundingClientRect().top + window.scrollY - headerH;
+      window.scrollTo({ top, behavior: reduceMotion ? "auto" : "smooth" });
+      const heading = document.getElementById("outcomes-h");
+      if (heading) {
+        const hadTabindex = heading.hasAttribute("tabindex");
+        if (!hadTabindex) heading.setAttribute("tabindex", "-1");
+        heading.focus();
+        if (!hadTabindex) heading.addEventListener("blur", () => heading.removeAttribute("tabindex"), { once: true });
+      }
+    });
+  }
 
   const statusSteps = statusEl ? JSON.parse(statusEl.dataset.steps || "[]") : [];
   const RING_CIRC = 175.9;
@@ -294,16 +321,31 @@ export function initStory() {
     window.__story = { state: () => ({ ready: false, staticFallback: true, reason }) };
   }
 
-  if (reduceMotion || !gsap || !ScrollTrigger || !window.WebGLRenderingContext) {
-    // Reduced motion always gets the static beats; missing GSAP/WebGL support
-    // (very old browsers) also degrades gracefully rather than risk a broken pin.
-    if (reduceMotion) return goStatic("reduced-motion");
-  }
+  // Reduced motion always gets the static beats. Missing GSAP/ScrollTrigger,
+  // or a browser/GPU that can't actually create a WebGL context (checked by
+  // attempting getContext, not just testing for the constructor's presence),
+  // also degrades gracefully — every one of these branches returns, so
+  // execution can never fall through to ScrollTrigger.create() below without
+  // both libraries and a real WebGL context. See code-map.md Summary #1.
+  if (reduceMotion) return goStatic("reduced-motion");
+  if (!gsap || !ScrollTrigger) return goStatic("no-gsap");
+  const __webglProbe = document.createElement("canvas");
+  const __hasWebGL = !!(__webglProbe.getContext("webgl") || __webglProbe.getContext("experimental-webgl"));
+  if (!__hasWebGL) return goStatic("no-webgl");
 
   const seqBase = root.dataset.seq || "assets/seq/v5";
   // isPhone: LAYOUT breakpoint only (stacked stage/rail/caption vs desktop
   // overlay rail), keyed on viewport width per the design spec.
   let isPhone = window.matchMedia("(max-width: 760px)").matches;
+  // D. short-landscape compact mode: viewport height <= 520px, or height <
+  // 0.6*width with height <= 720px (landscape phones / small tablets) — see
+  // css/story.css's .is-short-landscape block. Re-evaluated on every resize
+  // alongside isPhone.
+  let isShortLandscape = false;
+  function computeShortLandscape() {
+    const w = window.innerWidth, h = window.innerHeight;
+    return h <= 520 || (h < 0.6 * w && h <= 720);
+  }
   // useP: ASSET-SET selection, keyed on the stage's own ORIENTATION (its
   // rendered aspect ratio), independent of isPhone. A portrait-ish stage
   // (e.g. a tablet viewport with the desktop layout) still needs the p/
@@ -448,6 +490,7 @@ export function initStory() {
       return;
     }
     pickDims();
+    measureHeaderHeight();
     positionRail(); // manifest.chamber is known now; the initial resizeCanvas() ran before this
     positionCaptions();
     const base = `${seqBase}/${useP ? "p" : "d"}`;
@@ -821,8 +864,11 @@ export function initStory() {
     // stage tone and captions run identically whether or not the heavy
     // assets are ready (captions are just text/timing, no dependency on the
     // canvas or hold layers being loaded).
-    const toneIn = range(state.p, 0.13, 0.30);
-    const toneOut = range(state.p, 0.90, 0.97);
+    // Rescaled with the F. pin/hold rebalance (see SEG/HOLD comment above):
+    // 0.13/0.30 -> 0.1795/0.4143 (pre-hold zone, x1.38095); 0.90/0.97 ->
+    // 0.8619/0.9586 (post-hold zone, same transform anchored at holdEnd).
+    const toneIn = range(state.p, 0.1795, 0.4143);
+    const toneOut = range(state.p, 0.8619, 0.9586);
     const tone = clamp(toneIn - toneOut, 0, 1);
     const mineral = [232, 238, 233], dark = [15, 26, 23];
     const mix = mineral.map((v, i) => Math.round(lerp(v, dark[i], tone)));
@@ -889,18 +935,34 @@ export function initStory() {
     // gone before the reveal dissolve starts (now at 0.975, see SEG above) —
     // otherwise it ghosts through the cross-dissolve into the clean still.
     // 0.93-0.95 finishes the fade-out with a good margin to spare.
-    const railOp = range(state.p, 0.12, 0.16) * (1 - range(state.p, 0.93, 0.95));
+    // All four thresholds below are rescaled with the F. pin/hold rebalance
+    // (see SEG/HOLD comment): 0.12/0.16 -> 0.1657/0.2210 (pre-hold zone);
+    // 0.93/0.95 -> 0.9033/0.9310 (post-hold zone); 0.30/0.32 -> 0.4143/0.4419
+    // (pre-hold zone, ending exactly at the new holdStart); 0.84/0.845/
+    // 0.895/0.90 -> 0.8185/0.8221/0.8583/0.8619 (hold zone).
+    const railOp = range(state.p, 0.1657, 0.2210) * (1 - range(state.p, 0.9033, 0.9310));
     if (rail) rail.style.opacity = railOp.toFixed(3);
     // ring/readout: hidden entirely before the lock engages, then fades in
-    // exactly as the door seats (0.30-0.32) — before that the rail shows
-    // status text only ("Compartment 2", etc).
-    if (ringWrap) ringWrap.style.opacity = range(state.p, 0.30, 0.32).toFixed(3);
+    // exactly as the door seats — before that the rail shows status text
+    // only ("Compartment 2", etc).
+    if (ringWrap) ringWrap.style.opacity = range(state.p, 0.4143, 0.4419).toFixed(3);
     if (unlockLine) {
-      const uo = range(state.p, 0.84, 0.845) * (1 - range(state.p, 0.895, 0.90));
+      const uo = range(state.p, 0.8185, 0.8221) * (1 - range(state.p, 0.8583, 0.8619));
       unlockLine.style.opacity = uo.toFixed(3);
     }
     root.classList.toggle("in-cycle", state.locked);
     root.classList.toggle("is-done", state.p >= HOLD.timerEnd && state.p < SEG.openStart);
+  }
+
+  // D. Measure the real fixed header height (not a hard-coded assumption)
+  // and expose it as --header-h on .story-pin, where css/story.css's
+  // data-pos="top" caption fallback reads it via var(--header-h, 69px).
+  function measureHeaderHeight() {
+    const header = document.querySelector(".site-header");
+    const target = pin || root;
+    if (!header || !target) return;
+    const bottom = header.getBoundingClientRect().bottom;
+    target.style.setProperty("--header-h", `${Math.max(0, bottom)}px`);
   }
 
   function positionRail() {
@@ -917,7 +979,7 @@ export function initStory() {
     target.style.setProperty("--chamber-top", `${(c.top / stageRect.height) * 100}%`);
     target.style.setProperty("--chamber-width", `${(c.width / stageRect.width) * 100}%`);
     target.style.setProperty("--chamber-height", `${(c.height / stageRect.height) * 100}%`);
-    if (isPhone) { rail.removeAttribute("data-mode"); rail.style.left = ""; rail.style.top = ""; rail.style.transform = ""; return; }
+    if (isPhone || isShortLandscape) { rail.removeAttribute("data-mode"); rail.style.left = ""; rail.style.top = ""; rail.style.transform = ""; return; }
 
     // Desktop: the rail defaults to sitting beside the chamber's right edge
     // (mode "side", pure CSS via the vars above). If that would push its own
@@ -926,35 +988,82 @@ export function initStory() {
     // the chamber, fall back to a compact strip above it (mode "above").
     const VIEWPORT_MARGIN = 24, GAP = 22; // 1.4rem @ 16px root
     const chamberViewport = { left: stageRect.left + c.left, top: stageRect.top + c.top, width: c.width, height: c.height };
-    // Use the rail's worst-case size (its CSS max-width, and a generous
-    // height covering the 3-line "unlock" state), not its width at this
-    // instant: the status text's length changes every few percent of scroll
-    // ("Compartment 2" vs "Locked · cycle running" vs "Done · 4:52"), and
-    // positionRail() is only re-run on load/resize/breakpoint-change, not on
-    // every render(p) tick — deciding the layout mode from momentary content
-    // width would leave it wrong for every other status string.
-    const railWidth = 300;
-    const railHeight = 100;
+    // D. Measure the rail's REAL rendered size (its worst-case content is
+    // already on screen most of the time — the status text is long strings
+    // like "Locked · cycle running" — rather than the previous hard-coded
+    // 300x100 estimate, which could under- or over-estimate depending on the
+    // current status string's actual wrapped height).
+    rail.dataset.mode = "side";
+    rail.style.left = ""; rail.style.top = ""; rail.style.transform = "";
+    const measuredRail = rail.getBoundingClientRect();
+    const railWidth = measuredRail.width || 300;
+    const railHeight = measuredRail.height || 100;
     const sideLeft = chamberViewport.left + chamberViewport.width + GAP;
-    const vw = window.innerWidth;
+    const vw = window.innerWidth, vh = window.innerHeight;
     let mode = "side";
     if (sideLeft + railWidth > vw - VIEWPORT_MARGIN) {
       const rightModeLeft = vw - VIEWPORT_MARGIN - railWidth;
       mode = rightModeLeft < chamberViewport.left + chamberViewport.width ? "above" : "right";
     }
     rail.dataset.mode = mode;
+    // Bug found in D. acceptance sweep: writing an absolute pin-local px
+    // offset for the DEFAULT "side" mode (derived from a viewport-space
+    // clamp) is only correct if `stageRect` was measured WHILE the section
+    // is actually pinned. positionRail() can run (via resize/fonts.ready/
+    // window.load) before the user has ever scrolled to the story section,
+    // when `stageRect.top` is still its normal-flow document position (e.g.
+    // +2000px) rather than its pinned-viewport position (~header height).
+    // Baking a clamp computed from THAT snapshot into a fixed pin-local
+    // `top`/`left` then renders wildly off-screen once the section is
+    // actually pinned later (observed: rail top around -1250px). "side" mode
+    // is pure CSS calc() off the --chamber-* custom properties (percentage-
+    // based, so resolution/scroll-independent) precisely to avoid this class
+    // of bug — restore that instead of overriding it with a stale px snapshot.
     if (mode === "side") {
       rail.style.left = ""; rail.style.top = ""; rail.style.transform = "";
-    } else if (mode === "right") {
-      rail.style.left = `${vw - VIEWPORT_MARGIN - railWidth - stageRect.left}px`;
-      rail.style.top = `${chamberViewport.top + chamberViewport.height * 0.55 - stageRect.top}px`;
-      rail.style.transform = "translateY(-50%)";
+      return;
+    }
+    // "right"/"above" only trigger when the chamber is genuinely close to a
+    // viewport edge, which only happens while the section is actually near/
+    // in the viewport — but guard anyway: if the stage isn't currently
+    // intersecting the viewport at all, this call's snapshot can't be
+    // trusted (same staleness risk as above), so fall back to unclamped
+    // pure-CSS positioning rather than bake in a bad value.
+    if (stageRect.bottom < 0 || stageRect.top > vh) {
+      rail.dataset.mode = "side";
+      rail.style.left = ""; rail.style.top = ""; rail.style.transform = "";
+      return;
+    }
+    let railLeft, railTop, railTransform;
+    if (mode === "right") {
+      railLeft = vw - VIEWPORT_MARGIN - railWidth - stageRect.left;
+      railTop = chamberViewport.top + chamberViewport.height * 0.55 - stageRect.top;
+      railTransform = "translateY(-50%)";
     } else {
       // above: right-aligned to the viewport margin, sitting just above the chamber's top edge
-      rail.style.left = `${vw - VIEWPORT_MARGIN - railWidth - stageRect.left}px`;
-      rail.style.top = `${chamberViewport.top - stageRect.top - railHeight - GAP}px`;
-      rail.style.transform = "none";
+      railLeft = vw - VIEWPORT_MARGIN - railWidth - stageRect.left;
+      railTop = chamberViewport.top - stageRect.top - railHeight - GAP;
+      railTransform = "none";
     }
+    // D. safe-box clamp: pull the rail's final viewport-space rect fully
+    // inside [headerBottom+16, vh-16] x [16, vw-16] — the "above" mode in
+    // particular can otherwise land partly under a tall header on short
+    // viewports. Convert to the rail's TOP-LEFT in viewport space first
+    // (collapsing the translateY(-50%) centring into a plain top offset),
+    // clamp that rect, then write it back as absolute left/top with no
+    // transform. This is only trustworthy because we just confirmed above
+    // that stageRect reflects the section's CURRENT on-screen position.
+    const header = document.querySelector(".site-header");
+    const headerBottom = header ? header.getBoundingClientRect().bottom : 0;
+    const safeTop = headerBottom + 16, safeBottom = vh - 16, safeLeft = 16, safeRight = vw - 16;
+    const centred = railTransform === "translateY(-50%)";
+    const railViewportLeft = stageRect.left + railLeft;
+    const railViewportTop = stageRect.top + railTop - (centred ? railHeight / 2 : 0);
+    const clampedLeft = clamp(railViewportLeft, safeLeft, Math.max(safeLeft, safeRight - railWidth));
+    const clampedTop = clamp(railViewportTop, safeTop, Math.max(safeTop, safeBottom - railHeight));
+    rail.style.left = `${clampedLeft - stageRect.left}px`;
+    rail.style.top = `${clampedTop - stageRect.top}px`;
+    rail.style.transform = "none";
   }
 
   // Desktop only: the caption box is fixed bottom-left per spec, but its
@@ -966,8 +1075,42 @@ export function initStory() {
   // the chamber, drop one font step (.se-captions--tight); if that still
   // isn't enough, dock the whole caption block under the header instead
   // (data-pos="top") rather than ship an overlap.
+  // D. Measure the tallest caption's real content height with ALL captions
+  // temporarily made visible/static (so a wrapped-but-currently-hidden
+  // caption isn't undercounted) — synchronous, no rAF between the class
+  // toggle and the read, so there's nothing to paint in between.
+  function measureTallestCaption() {
+    if (!captionsBox) return 0;
+    captionsBox.classList.add("se-captions--measuring");
+    let maxH = 0;
+    captions.forEach((el) => { maxH = Math.max(maxH, el.scrollHeight); });
+    captionsBox.classList.remove("se-captions--measuring");
+    return maxH;
+  }
+
   function positionCaptions() {
-    if (!dims || !captionsBox || isPhone) { if (captionsBox) { captionsBox.classList.remove("se-captions--tight"); captionsBox.removeAttribute("data-pos"); } return; }
+    if (!dims || !captionsBox) return;
+    if (isPhone || isShortLandscape) {
+      // D. "make --se-caption-h fit the longest caption (measure on load and
+      // resize, don't clip)": the CSS default (112px / 25vh) assumed a fixed
+      // two-line caption; a long/injected caption at narrow widths can wrap
+      // to 3 lines and overflow that fixed band (confirmed in the D.
+      // acceptance sweep: phone captions overflowing the viewport bottom by
+      // a few px near the end of the cycle). Measure the real tallest
+      // caption and grow the band to fit, with the CSS value only as a floor.
+      captionsBox.classList.remove("se-captions--tight");
+      captionsBox.removeAttribute("data-pos");
+      captionsBox.style.maxHeight = "";
+      // A sane minimum band (96px) rather than trying to read the CSS
+      // default back out of getComputedStyle — a custom property's computed
+      // value is returned as its literal token string (e.g. "25vh"), not a
+      // resolved px number, so parsing it as a float would silently produce
+      // nonsense (25) rather than an error.
+      const MIN_CAPTION_H = 96;
+      const tallest = measureTallestCaption();
+      if (tallest > 0) root.style.setProperty("--se-caption-h", `${Math.max(MIN_CAPTION_H, tallest)}px`);
+      return;
+    }
     const stageRect = stage.getBoundingClientRect();
     const c = chamberToCss(stageRect.width, stageRect.height, dims.chamber, texAspect, getFocus());
     const chamberViewport = { left: stageRect.left + c.left, top: stageRect.top + c.top, right: stageRect.left + c.left + c.width, bottom: stageRect.top + c.top + c.height };
@@ -976,6 +1119,17 @@ export function initStory() {
       const r = el.getBoundingClientRect();
       return !(r.right < chamberViewport.left || chamberViewport.right < r.left || r.bottom < chamberViewport.top || chamberViewport.bottom < r.top);
     });
+
+    // Safe box per spec D: [headerBottom+16, vh-16] x [16, vw-16]. The
+    // captions box only ever grows upward (bottom-anchored, or top-anchored
+    // in data-pos="top"), so a max-height keeps its top edge from crossing
+    // out of view instead of letting long/injected text push it there.
+    const header = document.querySelector(".site-header");
+    const headerBottom = header ? header.getBoundingClientRect().bottom : 0;
+    const safeTop = headerBottom + 16, safeBottom = window.innerHeight - 16;
+    const availableH = Math.max(80, safeBottom - safeTop);
+    const tallest = measureTallestCaption();
+    captionsBox.style.maxHeight = `${Math.min(tallest, availableH)}px`;
 
     captionsBox.classList.remove("se-captions--tight");
     captionsBox.removeAttribute("data-pos");
@@ -1085,6 +1239,9 @@ export function initStory() {
     canvasEl.style.height = "100%";
     if (glCtx) glCtx.resize(rect.width, rect.height, dpr);
     else { canvasEl.width = Math.round(rect.width * dpr); canvasEl.height = Math.round(rect.height * dpr); if (ctx2d) ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0); }
+    isShortLandscape = computeShortLandscape();
+    root.classList.toggle("is-short-landscape", isShortLandscape);
+    measureHeaderHeight();
     positionRail();
     positionCaptions();
     requestRender();
@@ -1113,6 +1270,18 @@ export function initStory() {
       if (ScrollTrigger) ScrollTrigger.refresh();
     }, 150);
   });
+  // D. acceptance requires re-positioning on load, fonts.ready, resize,
+  // orientationchange and ScrollTrigger refresh. resize (above) covers most
+  // browsers' orientation change too, but iOS Safari can fire
+  // orientationchange without a matching resize, and a caption box measured
+  // before the webfont swaps in can be the wrong height — both call the same
+  // resizeCanvas() (which itself re-measures the header and repositions the
+  // rail/captions) rather than duplicating that logic.
+  window.addEventListener("orientationchange", () => resizeCanvas());
+  window.addEventListener("load", () => resizeCanvas());
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(() => resizeCanvas()).catch(() => {});
+  }
 
   // ------------------------------------------------------------ intersect
   if ("IntersectionObserver" in window) {
@@ -1144,7 +1313,10 @@ export function initStory() {
   ScrollTrigger.create({
     trigger: root,
     start: "top top",
-    end: () => "+=" + Math.round(window.innerHeight * 5.5),
+    // F. pacing pass: pin length reduced from 5.5·vh to 4.0·vh (see the
+    // SEG/HOLD rebalance comment above the constants for how the segment
+    // boundaries were rescaled to match).
+    end: () => "+=" + Math.round(window.innerHeight * 4.0),
     pin,
     pinSpacing: true,
     scrub: 0.35,
@@ -1152,7 +1324,12 @@ export function initStory() {
     invalidateOnRefresh: true,
     onUpdate: (self) => { render(self.progress); ensureLoop(); },
     onRefresh: (self) => { resizeCanvas(); render(self.progress); },
-    onToggle: (self) => { pinActive = self.isActive; ensureLoop(); },
+    // D. re-measure the moment the pin actually activates: any earlier
+    // positionRail()/positionCaptions() call (window.load, fonts.ready) can
+    // only have seen the section's un-pinned, normal-flow geometry, which is
+    // meaningless for the rail's "right"/"above" viewport-clamped modes (see
+    // the staleness comment in positionRail() above).
+    onToggle: (self) => { pinActive = self.isActive; if (pinActive) { measureHeaderHeight(); positionRail(); positionCaptions(); } ensureLoop(); },
   });
 
   // Reload-with-restored-scroll fix: this ScrollTrigger.create() call above

@@ -44,12 +44,18 @@
    close to the caption's top edge in places, so the box itself is kept as
    small as the copy allows — width capped at 380px/30%, tight padding, a
    smaller two-line-max headline — rather than relying on focus alone. */
-.se-captions { position: absolute; left: var(--grid-gutter); bottom: 20px; width: min(380px, 30%); z-index: 4; pointer-events: none; }
+.se-captions { position: absolute; left: var(--grid-gutter); bottom: 20px; width: min(380px, 30%); z-index: 4; pointer-events: none; overflow: hidden; }
 .se-caption {
   position: absolute; left: 0; bottom: 0; width: 100%; opacity: 0;
   background: rgba(247, 244, 236, 0.94); padding: 16px 20px;
   border-radius: var(--radius-lg); box-shadow: 0 20px 50px rgba(13, 19, 33, 0.14);
 }
+/* D. measuring pass (js/story.js measureTallestCaption()): make every
+   caption's real content height readable in one synchronous layout, without
+   the stacked/absolute/opacity-0 presentation that normally hides all but
+   the active one. Toggled on/off inside a single function call — nothing is
+   ever painted in this state. */
+.se-captions--measuring .se-caption { position: static; opacity: 1; }
 .se-caption .eyebrow { color: var(--teal); }
 .se-line {
   margin-top: var(--space-2); font-family: var(--font-display); font-weight: 800;
@@ -63,7 +69,12 @@
 /* fallback (desktop only, set by story.js when even the compact box can't
    clear the chamber at a given viewport width): dock under the header
    instead of bottom-left. */
-.se-captions[data-pos="top"] { top: calc(69px + var(--space-4)); bottom: auto; }
+/* --header-h is measured at runtime from .site-header's real rendered
+   bottom edge (js/story.js measureHeaderHeight()), not assumed — the header
+   height isn't fixed in CSS (it's padding-driven) so a hard-coded px value
+   would drift whenever the header's content/line-height changes. Falls back
+   to 69px (the old assumed value) only if JS hasn't set it yet. */
+.se-captions[data-pos="top"] { top: calc(var(--header-h, 69px) + var(--space-4)); bottom: auto; }
 
 /* status rail: anchored to the right edge of the chamber rect (set as
    percentages of the stage by story.js from manifest.chamber), vertically
@@ -98,7 +109,7 @@
    width regardless, but the P1 loading notice ("Loading the
    demonstration...") is longer and needs to wrap rather than clip. */
 .se-status { font-size: var(--text-micro); font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--teal-deep); }
-.se-sub { margin-top: 2px; font-size: 0.7rem; color: var(--teal); }
+.se-sub { margin-top: 2px; font-size: 0.7rem; color: var(--teal-deep); }
 .se-unlock {
   margin-top: var(--space-2); display: flex; align-items: center; gap: 6px;
   font-size: 0.72rem; font-weight: 700; color: var(--teal-deep); opacity: 0;
@@ -170,3 +181,30 @@
   .se-status { font-size: 0.68rem; }
   .se-sub, .se-unlock { display: none; }
 }
+
+/* D. short-landscape compact mode: js/story.js toggles .is-short-landscape
+   on [data-story] when viewport height <= 520px, or height < 0.6*width with
+   height <= 720px (a landscape phone/small tablet, where the phone-below
+   layout's stacked caption+rail footers would leave too little room for the
+   stage). Reduces the stage further and puts captions + rail in a single
+   row below it instead of two stacked bands, tightening the font. */
+.story.is-short-landscape[data-story] { --se-caption-h: 25vh; --se-rail-h: 0px; }
+.story.is-short-landscape .story-stage { top: 0; bottom: var(--se-caption-h); }
+.story.is-short-landscape .se-captions {
+  position: absolute; left: 0; right: 0; bottom: 0; top: auto; height: var(--se-caption-h);
+  width: auto; z-index: 4; display: flex;
+}
+.story.is-short-landscape .se-caption {
+  position: absolute; inset: 0; border-radius: 0; box-shadow: none;
+  padding: var(--space-2) var(--grid-gutter); background: var(--mineral);
+  display: flex; flex-direction: row; align-items: center; gap: var(--space-4); height: 100%;
+}
+.story.is-short-landscape .se-caption .eyebrow { flex: none; }
+.story.is-short-landscape .se-line { font-size: 0.95rem; line-height: 1.1; }
+.story.is-short-landscape .se-rail {
+  position: absolute; right: var(--space-3); bottom: var(--space-2); top: auto; left: auto;
+  transform: none; min-width: 0; max-width: 46%; width: max-content;
+  padding: var(--space-2) var(--space-3); z-index: 5;
+}
+.story.is-short-landscape .se-ring-wrap { width: 26px; height: 26px; }
+.story.is-short-landscape .se-sub, .story.is-short-landscape .se-unlock { display: none; }

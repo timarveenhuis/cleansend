@@ -8,7 +8,7 @@ if (gsap && ScrollTrigger) gsap.registerPlugin(ScrollTrigger);
 
 // The public address of this page. Used for "Copy link" so a preview opened
 // from localhost, a file, or an artifact container never shares a private URL.
-const PUBLIC_URL = (document.querySelector('link[rel="canonical"]') || {}).href || "https://timarveenhuis.github.io/cleansend-v4/";
+const PUBLIC_URL = (document.querySelector('link[rel="canonical"]') || {}).href || "https://timarveenhuis.github.io/cleansend/";
 
 /* ------------------------------------------------------------- header */
 function initHeaderScroll() {
@@ -17,6 +17,29 @@ function initHeaderScroll() {
   const update = () => header.classList.toggle("is-scrolled", window.scrollY > 4);
   update();
   window.addEventListener("scroll", update, { passive: true });
+}
+
+/* --------------------------------------------------------- hash landings */
+// J. navigation investigation (headed Chromium + WebKit) found history
+// back/forward could leave an anchor target scrolled to y=0, PARTIALLY
+// HIDDEN behind the fixed header — reproduced in WebKit specifically
+// (measured ~-191px gap; the CSS scroll-margin-top fix on #top/#final/
+// #privacy/#main/#outcomes already handles the forward "click a link" case
+// in both engines, since that's native anchor navigation, but WebKit's
+// scroll-position RESTORATION on popstate doesn't consistently reapply it).
+// Re-run the same scroll-margin-aware landing manually whenever the hash
+// changes for any reason, including back/forward.
+function initHashScrollFix() {
+  const landOnHash = () => {
+    if (!location.hash) return;
+    const target = document.getElementById(location.hash.slice(1));
+    if (!target) return;
+    // Let the browser's own (possibly wrong) restoration happen first, then
+    // correct it on the next frame rather than fight it mid-navigation.
+    requestAnimationFrame(() => target.scrollIntoView({ behavior: "auto", block: "start" }));
+  };
+  window.addEventListener("hashchange", landOnHash);
+  window.addEventListener("popstate", landOnHash);
 }
 
 /* ------------------------------------------------------------- reveals */
@@ -48,13 +71,23 @@ function initBeforeAfter() {
   const afterImg = frame.querySelector(".ba-after");
   const divider = frame.querySelector(".ba-divider");
   const handle = frame.querySelector(".ba-handle");
+  const beforeLabel = frame.querySelector(".ba-label--before");
+  const afterLabel = frame.querySelector(".ba-label--after");
 
   function update(val) {
     // the after image is clipped from the left by val%, so (100 - val)% of it is visible
     afterImg.style.clipPath = `inset(0 0 0 ${val}%)`;
     divider.style.left = `${val}%`;
-    handle.style.left = `${val}%`;
+    // H. clamp the handle's centre inside the frame (56px handle + a 6px
+    // focus-ring allowance either side) so it — and its focus ring — are
+    // never clipped by .ba-frame's overflow:hidden at the 0/100 endpoints.
+    handle.style.left = `clamp(34px, ${val}%, calc(100% - 34px))`;
     range.setAttribute("aria-valuetext", `${100 - val}% of the after image visible`);
+    // H. at val=0 the after image is fully visible (nothing clipped), so the
+    // before photo underneath is entirely covered — its badge would be
+    // claiming something not on screen; symmetric at val=100.
+    if (beforeLabel) beforeLabel.classList.toggle("is-hidden-endpoint", val <= 0);
+    if (afterLabel) afterLabel.classList.toggle("is-hidden-endpoint", val >= 100);
   }
 
   range.addEventListener("input", (e) => update(Number(e.target.value)));
@@ -96,7 +129,7 @@ function initForm() {
     e.preventDefault();
     if (submitting) return; // ignore double taps
     const value = emailInput.value.trim();
-    if (!value) return fail("Enter your email to join the list.");
+    if (!value) return fail("Enter an email to try the preview.");
     if (!isValidEmail(value)) return fail("That doesn't look like an email. Check the @ and try again.");
     submitting = true;
     submitBtn.disabled = true;
@@ -132,7 +165,7 @@ function initForm() {
       } catch (err) {
         saved = false;
       }
-      freqThanks.textContent = saved ? `Noted: ${freq}. Saved in this browser.` : `Noted: ${freq}. (Couldn't save it in this browser.)`;
+      freqThanks.textContent = saved ? `Noted: ${freq}. Saved in this browser only.` : `Noted: ${freq}. Couldn't save it in this browser.`;
     });
   });
 
@@ -167,12 +200,28 @@ function initPrivacyLink() {
 }
 
 /* ------------------------------------------------------------------ init */
+// Each init runs in isolation: a failure in one (e.g. a missing element, a
+// third-party lib not loading) must not prevent the others from running.
+function safeInit(name, fn) {
+  try {
+    fn();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(`[cleansend] ${name} failed to init:`, err);
+  }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
-  initHeaderScroll();
-  initReveals();
-  initStory();
-  initBeforeAfter();
-  initPrivacyLink();
-  initForm();
-  window.addEventListener("load", () => ScrollTrigger && ScrollTrigger.refresh());
+  safeInit("header", initHeaderScroll);
+  safeInit("hashScrollFix", initHashScrollFix);
+  safeInit("reveals", initReveals);
+  safeInit("beforeAfter", initBeforeAfter);
+  safeInit("privacyLink", initPrivacyLink);
+  safeInit("form", initForm);
+  // Story runs last: it's the heaviest init (WebGL/GSAP/ScrollTrigger) and
+  // must not be able to block header/reveals/before-after/privacy/form.
+  safeInit("story", initStory);
+  window.addEventListener("load", () => {
+    if (window.gsap && ScrollTrigger) safeInit("scrollTriggerRefresh", () => ScrollTrigger.refresh());
+  });
 });
