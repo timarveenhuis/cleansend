@@ -142,7 +142,7 @@ function initForm() {
     e.preventDefault();
     if (submitting) return; // ignore double taps
     const value = emailInput.value.trim();
-    if (!value) return fail("Enter an email to try the preview.");
+    if (!value) return fail("Enter an email to save your spot.");
     if (!isValidEmail(value)) return fail("That doesn't look like an email. Check the @ and try again.");
     submitting = true;
     submitBtn.disabled = true;

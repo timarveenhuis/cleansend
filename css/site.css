@@ -164,12 +164,15 @@ section { position: relative; }
 .hero-pair img { position: relative; width: 100%; height: auto; }
 
 @media (prefers-reduced-motion: no-preference) {
+  /* CS-08: entrance shortened from 700ms/120ms+220ms delays to 400ms with
+     delays capped at ~80ms so the hero reads as settled well inside the
+     first 450ms rather than taking nearly a second. */
   .hero-machine, .hero-pair {
     opacity: 0; transform: translateY(18px);
-    animation: hero-settle 700ms var(--ease-out-expo) forwards;
+    animation: hero-settle 400ms var(--ease-out-expo) forwards;
   }
-  .hero-machine { animation-delay: 120ms; }
-  .hero-pair { animation-delay: 220ms; }
+  .hero-machine { animation-delay: 0ms; }
+  .hero-pair { animation-delay: 80ms; }
   @keyframes hero-settle { to { opacity: 1; transform: translateY(0); } }
 }
 
@@ -415,7 +418,12 @@ html:not(.js) .story-stage, html:not(.js) .story-ui { display: none; }
 }
 .gym-annot-labels li { position: relative; padding-left: calc(22px + var(--space-2)); font-size: var(--text-small); }
 .gym-annot-labels li::before {
-  counter-increment: gym-step; content: counter(gym-step);
+  /* CS-12: "/ '' " is the CSS alt-text syntax — it keeps the numbered badge
+     visible but excludes it from the accessibility tree, so the list's own
+     native ordinal (restored via role="list" in the markup, since
+     list-style:none strips implicit list semantics in some browsers) is the
+     single number source instead of "1 1 Contactless pad". */
+  counter-increment: gym-step; content: counter(gym-step) / "";
   position: absolute; left: 0; top: 0; width: 22px; height: 22px; border-radius: 50%;
   background: var(--teal-deep); color: var(--chalk); display: grid; place-items: center;
   font-family: var(--font-display); font-weight: 800; font-size: 0.75rem;
