@@ -9,7 +9,15 @@
   --mint: #D9F4E6;
   --aqua: #AFE0CE;
   --signal: #2EE59D;
-  --teal: #517664;
+  /* CS-12: was #517664 (rgb 81,118,100) — measured 3.5-4.4:1 against the
+     mineral/mint/chalk backgrounds it's actually used on (hero-trust line,
+     form labels, pull-quote citations, headline accent), just under the
+     4.5:1 AA text minimum. Darkened to clear AA with margin (6.1:1 against
+     the worst-case sampled background) while staying visually distinct
+     from --teal-deep. Foreground-only token (never used as a background,
+     verified via grep), so this only improves contrast everywhere it's
+     used, including css/story.css's caption eyebrow which shares it. */
+  --teal: #415E50;
   --teal-deep: #1E4A3E;
   --teal-ink: #113029;
   --ink: #0D1321;
