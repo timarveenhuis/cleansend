@@ -785,14 +785,25 @@ export function initStory() {
   // of one at a time, closing the gap between loader throughput and
   // natural scroll speed. See stream-a/lag/logs/*-summary.json for the
   // before numbers and the after re-measurement.
-  async function loadSeqProgressive(base, bareSeg, count, targetCache = cache, cacheSeg = segKey(bareSeg), concurrency = 6) {
+  // Round 9 fix: the "every 4th frame first" priority order was designed
+  // to give a fast sparse overview of a segment the user hasn't reached
+  // yet — but for the segment the user is ACTIVELY, continuously
+  // scrolling through (confirmed to be `arrive`, loaded with top
+  // priority right after readiness), it actively fights a steadily-
+  // scrolling user, who needs frames in plain sequential order
+  // (0,1,2,3,...), not (0,4,8,...,1,2,3,5,6,7,...). Measured directly
+  // against the live site with page-side batched rAF sampling
+  // (qa/.../stream-a/lag/release4/): natural-pace scrolling produced a
+  // single CONTINUOUS 1.8s hold spanning arrive frames 7 through 34 (out
+  // of 36) — not brief gaps, a sustained "always a few frames behind"
+  // state through nearly the whole segment, exactly what a user would
+  // call "laggy". Switched to plain sequential order, and raised default
+  // concurrency 6 -> 8 (team lead's own originally-suggested 6-8 range)
+  // for additional headroom given how much the segment still needs to
+  // outrun natural scroll speed.
+  async function loadSeqProgressive(base, bareSeg, count, targetCache = cache, cacheSeg = segKey(bareSeg), concurrency = 8) {
     if (!count) return;
-    // every 4th frame first (covers the whole range quickly at low
-    // resolution), then fill the rest — same priority order as before,
-    // now drained by a worker pool instead of one item at a time.
-    const order = [];
-    for (let i = 0; i < count; i += 4) order.push(i);
-    for (let i = 0; i < count; i++) if (i % 4 !== 0) order.push(i);
+    const order = Array.from({ length: count }, (_, i) => i);
     let next = 0;
     async function worker() {
       while (next < order.length) {
@@ -851,6 +862,22 @@ export function initStory() {
     positionCaptions();
     const base = `${seqBase}/${useP ? "p" : "d"}`;
     currentBase = base;
+    // Round 9 fix: `arrive` previously only started loading AFTER `ready`
+    // (hold layers + close-essential-neighborhood) resolved. Measured
+    // directly against the live site: readiness itself takes 3.5-4s, and
+    // by then a naturally-paced scroll is often already partway through
+    // (or past) the arrive segment, leaving its 36-frame loader almost no
+    // head start — confirmed as the cause of a sustained ~1.8s continuous
+    // hold spanning nearly the whole segment (frames 7-34 of 36), not
+    // brief gaps (qa/.../stream-a/lag/release4/). `dims`/`base` are known
+    // as soon as pickDims() above returns, well before hold layers or the
+    // close-essential fetch even start — kick arrive off HERE, running
+    // concurrently with the rest of readiness instead of waiting for it,
+    // so it gets the full readiness duration as a head start rather than
+    // starting from zero once the user may already be well into the
+    // segment. The background loader chain below awaits this same
+    // promise instead of re-invoking loadSeqProgressive for arrive.
+    const arriveLoadPromise = dims.arrive ? loadSeqProgressive(base, "arrive", dims.arrive) : null;
 
     // P1 fix: fetch the small baked-050 standby BEFORE the heavy hold
     // layers/close sequence (~1.6 MB+) so scrolling into the locked/
@@ -964,7 +991,7 @@ export function initStory() {
     // forget). loadSeqFrame's own cache.has() check makes re-requesting the
     // already-preloaded close neighborhood above a harmless no-op.
     (async () => {
-      if (dims.arrive) await loadSeqProgressive(base, "arrive", dims.arrive);
+      if (arriveLoadPromise) await arriveLoadPromise;
       if (dims.close) { await loadSeqProgressive(base, "close", dims.close); closeReady = true; }
       if (dims.sweep) await loadSeqFramesConcurrent(base, "sweep", dims.sweep);
       if (dims.open) await loadSeqProgressive(base, "open", dims.open);
