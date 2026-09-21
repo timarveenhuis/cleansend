@@ -37,7 +37,7 @@ together so a stale cached tab is guaranteed to re-fetch the new files:
    the same manual bump the other static references above do.
 
 The token itself is an opaque string (currently a date-based
-`YYYYMMDD` + letter, e.g. `20260921h`) — any value works as long as it
+`YYYYMMDD` + letter, e.g. `20260921i`) — any value works as long as it
 changes on every release that changes assets.
 
 ## Notes
