@@ -1719,6 +1719,11 @@ export function initStory() {
         nonProtectedMaxBytes: cache.maxBytes,
         holdBytesEstimate,
         glFrameTextureCount: glCtx ? glCtx.frameTexOrder.length : null,
+        // CS-03 closure: real GPU-resident byte accounting (see
+        // StoryGL.getGPUBytes), not just a texture count — sums
+        // width*height*4 for every currently-live GL texture (sequence
+        // frames + 6 hold layers + noise + sweep placeholder).
+        gpuBytes: glCtx ? glCtx.getGPUBytes() : null,
       }),
       // test-only: draw whatever bitmap is actually stored in the cache for
       // (bareSeg,i) to a small canvas and return a pixel sample, to verify

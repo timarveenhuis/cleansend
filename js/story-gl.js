@@ -290,6 +290,36 @@ export class StoryGL {
     };
     this.frameTexCache = new Map(); // bitmap -> WebGLTexture, small LRU-ish cache
     this.frameTexOrder = [];
+    // CS-03 closure: GPU memory accounting (diag-only consumer, see
+    // js/story.js's debugCacheInfo). Every uploaded texture's byte size
+    // (width*height*4, RGBA8) is tracked here at upload time -- separate
+    // from frameTexCache's bitmap->tex map because a bitmap can be
+    // .close()'d (freeing its own JS-side .width/.height) while its GL
+    // texture is still resident, so byte accounting can't be recomputed
+    // lazily from the bitmap later.
+    this.frameTexBytes = new Map(); // bitmap -> bytes
+    this.holdTexBytes = { dirtyOff: 0, dirtyOn: 0, cleanOn: 0, cleanOff: 0, map: 0, window: 0 };
+    this.noiseBytes = 0;
+    this.sweepPlaceholderBytes = 4; // 1x1 RGBA
+  }
+
+  // CS-03 closure: sum of every currently-live GL texture's byte size —
+  // sequence frames (frameTexBytes) + the 6 fixed hold layers +
+  // GL noise textures + the sweep placeholder. This is the actual GPU-
+  // resident footprint, not a proxy (unlike the earlier texture-COUNT-only
+  // metric).
+  getGPUBytes() {
+    let frameBytes = 0;
+    for (const b of this.frameTexBytes.values()) frameBytes += b;
+    const holdBytes = Object.values(this.holdTexBytes).reduce((s, b) => s + b, 0);
+    return {
+      frameBytes,
+      holdBytes,
+      noiseBytes: this.noiseBytes,
+      sweepPlaceholderBytes: this.sweepPlaceholderBytes,
+      totalBytes: frameBytes + holdBytes + this.noiseBytes + this.sweepPlaceholderBytes,
+      liveFrameTextureCount: this.frameTexOrder.length,
+    };
   }
 
   _locate(prog, names) {
@@ -340,15 +370,18 @@ export class StoryGL {
 
   setHoldLayer(name, source) {
     if (!this.holdTex[name] || !source) return;
-    this._uploadInto(this.holdTex[name], source);
+    const uploaded = this._uploadInto(this.holdTex[name], source);
+    if (uploaded) this.holdTexBytes[name] = (source.width || 0) * (source.height || 0) * 4;
   }
 
   // Real tileable noise (assets/gl/noise-{a,b,fine}.png), REPEAT-wrapped.
   setNoiseTextures(a, b, fine) {
     const gl = this.gl;
+    let bytes = 0;
     const upload = (tex, source) => {
       if (!source) return;
-      this._uploadInto(tex, source);
+      const uploaded = this._uploadInto(tex, source);
+      if (uploaded) bytes += (source.width || 0) * (source.height || 0) * 4;
       gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
@@ -356,6 +389,7 @@ export class StoryGL {
     upload(this.noiseA, a);
     upload(this.noiseB, b);
     upload(this.noiseFine, fine);
+    this.noiseBytes = bytes;
   }
 
   // Returns (and caches) a texture for a decoded frame bitmap. Caller owns
@@ -378,6 +412,7 @@ export class StoryGL {
       return this.sweepPlaceholder;
     }
     this.frameTexCache.set(bitmap, tex);
+    this.frameTexBytes.set(bitmap, (bitmap.width || 0) * (bitmap.height || 0) * 4);
     this.frameTexOrder.push(bitmap);
     // keep at most 24 GL textures resident for sequence frames
     while (this.frameTexOrder.length > 24) {
@@ -385,6 +420,7 @@ export class StoryGL {
       const t = this.frameTexCache.get(old);
       if (t) gl.deleteTexture(t);
       this.frameTexCache.delete(old);
+      this.frameTexBytes.delete(old);
     }
     return tex;
   }
@@ -393,6 +429,7 @@ export class StoryGL {
     const gl = this.gl;
     const t = this.frameTexCache.get(bitmap);
     if (t) { gl.deleteTexture(t); this.frameTexCache.delete(bitmap); }
+    this.frameTexBytes.delete(bitmap);
     const i = this.frameTexOrder.indexOf(bitmap);
     if (i >= 0) this.frameTexOrder.splice(i, 1);
   }
