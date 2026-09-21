@@ -1119,7 +1119,19 @@ export function initStory() {
   // before asking for it — see FrameCache's windowKeys comment for why this
   // is necessary (background prefetch of the OTHER sequences would otherwise
   // race ahead and evict exactly what's on screen right now).
-  const WINDOW_RADIUS = 4;
+  // Live-site lag dig (round 8, stream-a/lag/after-live/dig-rootcause-
+  // result.json): re-measured on release 3 with page-side batched rAF
+  // sampling (ruling out the earlier per-step page.evaluate() harness as
+  // an inflating factor — batched sampling found an equal-or-higher raw
+  // stall fraction). Distance-from-nearest-resident-frame histogram on
+  // every stall showed 349 of 364 (96%) within the ORIGINAL radius of 4 —
+  // i.e. already-intended micro-holds, not the "distant jump" this
+  // bounding exists to prevent. Of the remaining 15 genuinely-outside-
+  // window stalls, every single one was at distance 5 or 6 — one or two
+  // frames past the old boundary, never a real distant gap — so widening
+  // to 6 directly closes that residual set (evidenced, not a guess) while
+  // still bounding the "hold" to something well short of a real jump.
+  const WINDOW_RADIUS = 6;
   // `bareSeg` is the on-disk sequence name ("arrive"/"close"/"open"/
   // "sweep"); internally namespaced by segKey() to the LIVE camera so a
   // background switchCamera() load (into a separate cache instance) can
