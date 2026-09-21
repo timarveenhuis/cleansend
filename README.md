@@ -13,6 +13,29 @@ python3 -m http.server 8000
 
 Then open `http://localhost:8000/` in a browser.
 
+## Cache-busting token
+
+Every static reference (stylesheets, `js/site.js`, font preload links and
+`@font-face` URLs, the favicon, vendor scripts, `<img>`/`<source srcset>`
+references, and the `og:image` URL) carries a `?v=<token>` query string, and
+`<html data-build="<token>">` exposes the same token to JavaScript — `js/story.js`
+reads it to version the dynamically-fetched story sequence assets
+(`assets/seq/v5/manifest.json` and its frames), which live outside `index.html`.
+
+**Before a release that changes any asset**, bump the token in these places
+together so a stale cached tab is guaranteed to re-fetch the new files:
+
+1. `index.html`: the `data-build` attribute on `<html>`, and every `?v=`
+   query string (search/replace the old token for the new one).
+2. `js/site.js`: the `?v=` on the `import ... from "./story.js"` line.
+3. `css/fonts.css`: the `?v=` on both `@font-face` `src: url(...)` pairs.
+4. Wherever `js/story.js` reads `document.documentElement.dataset.build` for
+   its own asset fetches (that file's own responsibility to keep in sync).
+
+The token itself is an opaque string (currently a date-based
+`YYYYMMDD` + letter, e.g. `20260921a`) — any value works as long as it
+changes on every release that changes assets.
+
 ## Notes
 
 - The email signup form on this page is a local-only demo. It does not send
