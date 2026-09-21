@@ -641,7 +641,67 @@ export function initStory() {
 
   cache.onEvict = (bitmap) => { if (glCtx) glCtx.dropFrameTexture(bitmap); };
 
+  // Round 10 (live-site lag): decode pool. fetch()+createImageBitmap() for
+  // sequence frames run in js/story-worker.js instances instead of on the
+  // main thread — measured WebKit decode time (~25ms/frame, 3x Chromium's
+  // ~9ms) was a real, independently-confirmed cost that a loading-order
+  // fix alone can't remove. A small fixed pool (not one worker per
+  // decode) keeps thread-creation overhead bounded; each worker handles
+  // requests one at a time via its own message queue. Falls back to
+  // main-thread decoding (the pre-existing decodeOne/decodeOneCapped
+  // below) if Worker construction fails for any reason (module scripts
+  // blocked, CSP, browser quirk) — checked once, not per frame.
+  const DECODE_WORKER_COUNT = 4;
+  let decodeWorkers = [];
+  let workerDecodeSupported = false;
+  let nextWorkerRequestId = 1;
+  let nextWorkerIndex = 0;
+  const pendingWorkerRequests = new Map();
+  function initDecodeWorkers() {
+    if (typeof Worker === "undefined") return;
+    try {
+      const workerUrl = new URL("story-worker.js", import.meta.url);
+      for (let i = 0; i < DECODE_WORKER_COUNT; i++) {
+        const w = new Worker(workerUrl);
+        w.onmessage = (e) => {
+          const { id, ok, bitmap, error } = e.data;
+          const pending = pendingWorkerRequests.get(id);
+          if (!pending) return;
+          pendingWorkerRequests.delete(id);
+          if (ok) pending.resolve(bitmap); else pending.reject(new Error(error));
+        };
+        w.onerror = () => { /* leave workerDecodeSupported as-is; a single bad message shouldn't disable the whole pool */ };
+        decodeWorkers.push(w);
+      }
+      workerDecodeSupported = decodeWorkers.length > 0;
+    } catch (e) {
+      workerDecodeSupported = false;
+      decodeWorkers = [];
+    }
+  }
+  function decodeInWorker(url, maxW, maxH) {
+    return new Promise((resolve, reject) => {
+      const id = nextWorkerRequestId++;
+      pendingWorkerRequests.set(id, { resolve, reject });
+      const w = decodeWorkers[nextWorkerIndex % decodeWorkers.length];
+      nextWorkerIndex++;
+      // Bug found during smoke-testing (WebKit surfaced it as a 404 on
+      // every request; the fallback path silently masked it in Chromium):
+      // a relative URL passed into a Worker resolves against the WORKER
+      // SCRIPT's own location (js/story-worker.js), not the page's --
+      // "assets/seq/v5/..." would resolve to ".../js/assets/seq/v5/...".
+      // Resolve to an absolute URL against the PAGE's location before
+      // sending, so it's unambiguous regardless of the worker's own base.
+      const absoluteUrl = new URL(url, document.baseURI).href;
+      w.postMessage({ id, url: absoluteUrl, maxW, maxH });
+    });
+  }
+  initDecodeWorkers();
+
   async function decodeOne(url) {
+    if (workerDecodeSupported) {
+      try { return await decodeInWorker(versioned(url)); } catch (e) { /* fall through to main-thread path below */ }
+    }
     try {
       const res = await fetch(versioned(url));
       if (!res.ok) throw new Error(String(res.status));
@@ -658,6 +718,9 @@ export function initStory() {
   // pixels that's shown on a 1440px canvas — when the canvas is smaller).
   // Never upscales: a source already at or below the cap is used as-is.
   async function decodeOneCapped(url, maxW, maxH) {
+    if (workerDecodeSupported) {
+      try { return await decodeInWorker(versioned(url), maxW, maxH); } catch (e) { /* fall through to main-thread path below */ }
+    }
     try {
       const res = await fetch(versioned(url));
       if (!res.ok) throw new Error(String(res.status));
@@ -845,6 +908,75 @@ export function initStory() {
     loadSeqFrame(currentBase, bareSeg, i, count);
   }
 
+  // Round 10: demand-driven priority queue, replacing the fixed loader
+  // order (arrive->close->sweep->open / arrive+close concurrent). Team
+  // lead's read of the raw natural-pace numbers found the holds occur at
+  // fixed scroll points where a fixed loader order hasn't reached the
+  // segment the user is actually in — true regardless of which exact
+  // magnitude is right, and the 1280x720 reversal bug independently
+  // confirmed a fixed order can leave the WRONG segment unloaded when the
+  // user reverses. A priority queue keyed by distance from the CURRENTLY
+  // requested frame — recomputed on every pick, so it naturally re-
+  // prioritizes on every scroll update — generalizes and replaces both
+  // the ad hoc ordering and the round-9 patches.
+  //
+  // Priority: the frame within the ACTIVE segment closest to the current
+  // frame ranks best (0 = exact frame, 1 = one away, ...; "expanding
+  // forward then backward" falls out naturally from plain absolute
+  // distance). Frames in other segments rank behind all active-segment
+  // frames, ordered by their segment's position in the viewing timeline
+  // (arrive first, open last) as a reasonable fallback for a segment the
+  // user hasn't reached yet. In-flight fetches are never cancelled —
+  // `pending` items are simply removed once claimed by a worker and
+  // stay claimed until that fetch resolves; a persistent worker pool
+  // (bounded concurrency) just keeps picking whatever currently ranks
+  // best among what's left.
+  const SEG_VIEW_ORDER = { arrive: 0, close: 1, sweep: 2, open: 3 };
+  function priorityRank(bareSeg, idx) {
+    const cur = computeState(lastState.p);
+    if (cur.seg === bareSeg) return Math.abs(idx - cur.frame);
+    if (cur.seg === "hold" && bareSeg === "sweep") return Math.abs(idx - cur.sweepFrame);
+    return 100000 + SEG_VIEW_ORDER[bareSeg] * 1000;
+  }
+  // Loads every not-yet-resident frame across arrive/close/sweep/open for
+  // one camera (`camPrefix` = "d_"/"p_", `d` = that camera's manifest
+  // dims), via a persistent worker pool that always picks the
+  // currently-highest-priority remaining item. `keyFn(bareSeg)` lets the
+  // caller target either the live `cache` (segKey, default) or a
+  // switchCamera() shadow cache under its own prefix.
+  async function priorityLoadAll(base, targetCache, d, concurrency = 8, keyFn = segKey) {
+    const pending = [];
+    const addSeg = (bareSeg, count) => {
+      if (!count) return;
+      for (let i = 0; i < count; i++) if (!targetCache.has(keyFn(bareSeg), i)) pending.push({ bareSeg, i });
+    };
+    addSeg("arrive", d.arrive); addSeg("close", d.close); addSeg("sweep", d.sweep); addSeg("open", d.open);
+    const claimed = new Set();
+    async function worker() {
+      for (;;) {
+        if (farOffscreen) return;
+        let bestIdx = -1, bestRank = Infinity;
+        for (let k = 0; k < pending.length; k++) {
+          const item = pending[k];
+          if (!item) continue;
+          const key = `${item.bareSeg}:${item.i}`;
+          if (claimed.has(key)) continue;
+          const rank = priorityRank(item.bareSeg, item.i);
+          if (rank < bestRank) { bestRank = rank; bestIdx = k; }
+        }
+        if (bestIdx === -1) return; // nothing left unclaimed (either done or all in-flight)
+        const item = pending[bestIdx];
+        const key = `${item.bareSeg}:${item.i}`;
+        claimed.add(key);
+        pending[bestIdx] = null;
+        await loadSeqFrame(base, item.bareSeg, item.i, d[item.bareSeg], targetCache, keyFn(item.bareSeg));
+        claimed.delete(key);
+      }
+    }
+    const n = Math.max(1, Math.min(concurrency, pending.length || 1));
+    await Promise.all(Array.from({ length: n }, () => worker()));
+  }
+
   async function startLoading() {
     if (loadingStarted) return;
     loadingStarted = true;
@@ -862,22 +994,20 @@ export function initStory() {
     positionCaptions();
     const base = `${seqBase}/${useP ? "p" : "d"}`;
     currentBase = base;
-    // Round 9 fix: `arrive` previously only started loading AFTER `ready`
-    // (hold layers + close-essential-neighborhood) resolved. Measured
-    // directly against the live site: readiness itself takes 3.5-4s, and
-    // by then a naturally-paced scroll is often already partway through
-    // (or past) the arrive segment, leaving its 36-frame loader almost no
-    // head start — confirmed as the cause of a sustained ~1.8s continuous
-    // hold spanning nearly the whole segment (frames 7-34 of 36), not
-    // brief gaps (qa/.../stream-a/lag/release4/). `dims`/`base` are known
-    // as soon as pickDims() above returns, well before hold layers or the
-    // close-essential fetch even start — kick arrive off HERE, running
-    // concurrently with the rest of readiness instead of waiting for it,
-    // so it gets the full readiness duration as a head start rather than
-    // starting from zero once the user may already be well into the
-    // segment. The background loader chain below awaits this same
-    // promise instead of re-invoking loadSeqProgressive for arrive.
-    const arriveLoadPromise = dims.arrive ? loadSeqProgressive(base, "arrive", dims.arrive) : null;
+    // Round 10: start the FULL priority-queue load (all four sequences)
+    // as early as possible — `dims`/`base` are known as soon as
+    // pickDims() above returns, well before hold layers or the close-
+    // essential readiness fetch even start. This is round 9's "kick
+    // arrive off early" generalized to every segment, via the priority
+    // queue defined above: whichever frame is actually closest to the
+    // current scroll position (arrive/frame 0 on a fresh load) naturally
+    // wins priority regardless of segment, and re-prioritizes itself as
+    // `lastState.p` changes — no separate per-segment kickoff logic
+    // needed. `.then()` marks closeReady once the whole pass settles
+    // (closeReady isn't read elsewhere, kept for parity with prior
+    // rounds' semantics).
+    const backgroundLoadPromise = priorityLoadAll(base, cache, dims, 8);
+    backgroundLoadPromise.then(() => { closeReady = true; });
 
     // P1 fix: fetch the small baked-050 standby BEFORE the heavy hold
     // layers/close sequence (~1.6 MB+) so scrolling into the locked/
@@ -971,45 +1101,9 @@ export function initStory() {
       setTimeout(() => canvasEl.classList.remove("is-revealing"), 320);
     }
     requestRender();
-
-    // Live-site lag fix: these four background loaders previously all
-    // started at once, each internally concurrent (5-6 way). Diagnosed
-    // directly against the live site (stream-a/lag/): even with each
-    // loader's own concurrency raised, real arrive-frame throughput was
-    // far below what 6-way parallelism should achieve (12 of 36 frames
-    // resident 1.5s after readiness, on a 20Mbps/40ms profile) — traced to
-    // the four loaders (up to 6+6+5+6=23 desired simultaneous requests)
-    // contending for the SAME per-origin connection budget (Chromium caps
-    // HTTP/1.1 at 6 connections/origin; even under HTTP/2, four
-    // simultaneous decode streams compete for the same main-thread
-    // decode/upload time). `arrive` is needed almost immediately (it's the
-    // very next segment after the dirty-dissolve), `sweep` only once
-    // `hold` is reached, `open` last — so those still run in that
-    // viewing-order priority, without ever blocking `ready` above (this
-    // IIFE is fire-and-forget).
-    //
-    // Round 9 correction: `close` was ALSO put fully after `arrive` in
-    // that sequential chain, on the assumption it's needed strictly
-    // later. Measured directly against the live site with a corrected,
-    // wall-clock-accurate scroll harness: a REVERSAL back into `close`
-    // shortly after the forward pass found close's remainder essentially
-    // unloaded (a continuous ~1.1s hold, frames 6->1, only the readiness-
-    // time essential neighborhood present) — `close`'s full-sequence load
-    // hadn't even started yet, because `arrive` (36 frames) hadn't fully
-    // finished. A user who reverses direction early can reach `close`
-    // long before a strictly-sequential arrive-then-close chain gets
-    // there. Run `arrive` and `close` CONCURRENTLY instead (both are
-    // needed early — forward OR reversed), while still deferring
-    // `sweep`/`open` until both finish (they're only needed once `hold`/
-    // `open` are actually reached). loadSeqFrame's own cache.has() check
-    // makes re-requesting the already-preloaded close neighborhood above
-    // a harmless no-op.
-    (async () => {
-      const closePromise = dims.close ? loadSeqProgressive(base, "close", dims.close).then(() => { closeReady = true; }) : null;
-      await Promise.all([arriveLoadPromise, closePromise]);
-      if (dims.sweep) await loadSeqFramesConcurrent(base, "sweep", dims.sweep);
-      if (dims.open) await loadSeqProgressive(base, "open", dims.open);
-    })();
+    // backgroundLoadPromise (started above, right after pickDims()) is
+    // already running the full priority-queue load — nothing further to
+    // kick off here.
   }
 
   function pickDims() {
@@ -1969,16 +2063,9 @@ export function initStory() {
       // one is live, rather than holding both resident indefinitely.
       cache.evictPrefix(oldPrefix);
 
-      // Live-site lag fix: sequential viewing-order priority instead of
-      // four simultaneous loaders — see the matching comment in
-      // startLoading() for the full diagnosis (connection/decode
-      // contention across loaders, confirmed against the live site).
-      (async () => {
-        if (targetDims.arrive) await loadSeqProgressive(targetBase, "arrive", targetDims.arrive, cache, targetPrefix + "arrive");
-        if (targetDims.close) { await loadSeqProgressive(targetBase, "close", targetDims.close, cache, targetPrefix + "close"); closeReady = true; }
-        if (targetDims.sweep) await loadSeqFramesConcurrent(targetBase, "sweep", targetDims.sweep, cache, 5, targetPrefix + "sweep");
-        if (targetDims.open) await loadSeqProgressive(targetBase, "open", targetDims.open, cache, targetPrefix + "open");
-      })();
+      // Round 10: same demand-driven priority queue as startLoading(),
+      // targeted at this new camera's namespaced cache keys.
+      priorityLoadAll(targetBase, cache, targetDims, 8, (bareSeg) => targetPrefix + bareSeg).then(() => { closeReady = true; });
     } finally {
       switchingCamera = false;
       // A resize/rotation that happened WHILE this switch was in flight is
