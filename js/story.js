@@ -30,7 +30,7 @@
 // it) -- picked deliberately over the dynamic-import alternative for
 // that reason. Bump this token together with every other location listed
 // in README.md's "Cache-busting token" section.
-import { StoryGL } from "./story-gl.js?v=20260921f";
+import { StoryGL } from "./story-gl.js?v=20260921g";
 
 const gsap = window.gsap;
 const ScrollTrigger = window.ScrollTrigger;
