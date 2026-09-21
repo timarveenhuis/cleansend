@@ -31,6 +31,10 @@ together so a stale cached tab is guaranteed to re-fetch the new files:
 3. `css/fonts.css`: the `?v=` on both `@font-face` `src: url(...)` pairs.
 4. Wherever `js/story.js` reads `document.documentElement.dataset.build` for
    its own asset fetches (that file's own responsibility to keep in sync).
+5. `js/story.js`: the `?v=` on the `import { StoryGL } from "./story-gl.js?v=..."`
+   line at the top of the file. This one is a static (not dynamically read)
+   specifier, by choice — see the comment above that import — so it needs
+   the same manual bump the other static references above do.
 
 The token itself is an opaque string (currently a date-based
 `YYYYMMDD` + letter, e.g. `20260921a`) — any value works as long as it

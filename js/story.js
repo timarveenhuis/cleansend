@@ -17,7 +17,20 @@
 // Fallbacks: reduced motion / no JS / manifest or hold-layer failure -> the
 // three static stills (.story-static, styled by site.css). No WebGL -> a
 // canvas-2D crossfade between five baked hold states, no mist.
-import { StoryGL } from "./story-gl.js";
+// Gate 3 defect #5 (cache-busting): a static `import` specifier is
+// resolved by the browser's module preloader at parse time, in parallel
+// with the rest of document parsing, before initStory() ever runs -- a
+// dynamic `import('./story-gl.js?v=' + build)` would instead be awaited
+// mid-function (inside startLoading(), right where `glCtx = new
+// StoryGL(...)` happens today), adding a network round-trip at exactly
+// the point that currently just constructs an already-loaded class,
+// delaying first paint of the canvas-based content. Baking the token as
+// a static specifier keeps load timing unchanged at the cost of a second
+// hardcoded location (README's cache-busting bump list, item 5, covers
+// it) -- picked deliberately over the dynamic-import alternative for
+// that reason. Bump this token together with every other location listed
+// in README.md's "Cache-busting token" section.
+import { StoryGL } from "./story-gl.js?v=20260921a";
 
 const gsap = window.gsap;
 const ScrollTrigger = window.ScrollTrigger;
@@ -1553,15 +1566,26 @@ export function initStory() {
       // spans the full band regardless of its own padding, so the rail's
       // opaque pill genuinely sits on top of the caption's opaque
       // background at that width x height range — confirmed by geometry
-      // sweep, not just a text-reflow issue. Shrink the caption row's own
-      // right edge (override the `right:0` half of the stylesheet's
-      // `inset:0` with an inline longhand, which wins the cascade) by the
-      // rail's real rendered width, so the two boxes never touch.
-      const railW = isShortLandscape && rail ? rail.getBoundingClientRect().width : 0;
-      captions.forEach((el) => { el.style.right = railW > 0 ? `${railW + 16}px` : ""; });
+      // sweep, not just a text-reflow issue. Shrinking `right` alone did
+      // NOT work: the base `.se-caption` rule (css/story.css) sets an
+      // explicit `width: 100%`, which the short-landscape override never
+      // redeclares, so the browser uses that explicit width outright and
+      // ignores the auto-width-from-left/right computation `right` alone
+      // relies on. A LIVE measurement of the rail's rendered width doesn't
+      // work either: positionCaptions() only re-runs on resize/load/pin-
+      // toggle, but the rail's own width changes every scroll tick as its
+      // status text changes (short status vs. "Locked - cycle running"),
+      // so a width baked in at the last structural event can go stale
+      // mid-scroll and undershoot (confirmed: caption still overlapped the
+      // rail by ~35px despite a nonzero reservation). Use the rail's own
+      // CSS-declared worst case instead -- `.se-rail` is capped at
+      // `max-width: 46%` in this mode -- so reserving the complementary
+      // ~54% is correct regardless of the rail's current text and never
+      // needs to track it live.
+      captions.forEach((el) => { el.style.width = isShortLandscape ? "calc(54% - 16px)" : ""; });
       return;
     }
-    captions.forEach((el) => { el.style.right = ""; });
+    captions.forEach((el) => { el.style.width = ""; });
     const stageRect = stage.getBoundingClientRect();
     const c = chamberToCss(stageRect.width, stageRect.height, dims.chamber, texAspect, getFocus());
     const chamberViewport = { left: stageRect.left + c.left, top: stageRect.top + c.top, right: stageRect.left + c.left + c.width, bottom: stageRect.top + c.top + c.height };
