@@ -196,7 +196,21 @@ const MAX_RESIDENT_FRAMES = 20;
 // resolution — the byte budget exists as a hard backstop against a future
 // higher-resolution asset regenerate silently blowing the memory budget
 // even while staying under the frame-count cap).
-const MAX_RESIDENT_BYTES = 40 * 1024 * 1024;
+// Round 10: raised 40MB -> 64MB (~10 frames at 6.29MB each, up from ~6).
+// Root-caused a persistent hold that survived the priority-queue rewrite:
+// with all four sequences now loading somewhat concurrently (by design —
+// that's the whole point of the priority queue), a single shared 40MB
+// non-protected window was too small to hold even ONE segment's nearby
+// frames without them being evicted by the OTHER three segments' own
+// loads landing in the same shared budget -- confirmed directly
+// (qa/.../stream-a/lag/release4/): `close` frames near the actively-
+// needed one were resident only sparsely (endpoints + a couple of
+// leftovers), non-protected bytes sitting right at the old 40MB ceiling.
+// 64MB still leaves comfortable headroom under the 180MB MAX_TOTAL_BYTES
+// total ceiling (measured protected/fixed overhead ~100-105MB with sweep
+// capped, so 64MB non-protected keeps the worst case ~165-170MB, still
+// under 180MB).
+const MAX_RESIDENT_BYTES = 64 * 1024 * 1024;
 // CS-03 hard ceiling: a genuine cap on TOTAL decoded bytes (protected +
 // non-protected), unlike MAX_RESIDENT_BYTES above which only ever bounded
 // the non-protected LRU slice. With sweep capped to <=1024x683 (see
@@ -651,7 +665,15 @@ export function initStory() {
   // main-thread decoding (the pre-existing decodeOne/decodeOneCapped
   // below) if Worker construction fails for any reason (module scripts
   // blocked, CSP, browser quirk) — checked once, not per frame.
-  const DECODE_WORKER_COUNT = 4;
+  // Round 10: raised 4 -> 6. One worker is now permanently reserved for
+  // urgent (on-demand, resolveFrame-triggered) requests (see
+  // decodeInWorker's urgent routing below) so it's never stuck behind a
+  // background backlog -- but carving that out of a pool of only 4 would
+  // have cut background throughput by a quarter on WebKit, whose
+  // measured per-frame decode cost is already ~3x Chromium's. Raising to
+  // 6 keeps 5 workers on background loading (net INCREASE from the
+  // original 4) while still guaranteeing the urgent lane.
+  const DECODE_WORKER_COUNT = 6;
   let decodeWorkers = [];
   let workerDecodeSupported = false;
   let nextWorkerRequestId = 1;
@@ -679,12 +701,37 @@ export function initStory() {
       decodeWorkers = [];
     }
   }
-  function decodeInWorker(url, maxW, maxH) {
+  // Root-caused a persistent hold (~1.1s, reproducible) that survived
+  // every fix to the JS-side priority queue itself: that queue only
+  // controls which job gets PICKED and posted to a worker next -- it has
+  // no say over what a Worker does once the message is already sitting
+  // in that worker's own mailbox, and a Worker drains its mailbox
+  // strictly FIFO. With priorityLoadAll continuously feeding ~80+
+  // low-priority background frames through only DECODE_WORKER_COUNT (4)
+  // real workers, an urgent on-demand request (priorityFetch, called by
+  // resolveFrame for the frame the user is ACTUALLY waiting on right
+  // now) posted to a worker that already has a deep backlog queued
+  // ahead of it has to wait for all of that backlog first -- confirmed
+  // directly (qa/.../stream-a/lag/release4/): the same 3-4 sparse close
+  // frames stayed resident indefinitely regardless of current scroll
+  // position, with the actively-needed frame silently stuck behind a
+  // continuous stream of unrelated background decodes. Fix: reserve one
+  // worker exclusively for urgent (on-demand) requests, never fed by the
+  // background priority queue, so an urgent request is never stuck
+  // behind a background backlog. Background loads round-robin the
+  // remaining workers.
+  function decodeInWorker(url, maxW, maxH, urgent) {
     return new Promise((resolve, reject) => {
       const id = nextWorkerRequestId++;
       pendingWorkerRequests.set(id, { resolve, reject });
-      const w = decodeWorkers[nextWorkerIndex % decodeWorkers.length];
-      nextWorkerIndex++;
+      let w;
+      if (urgent || decodeWorkers.length < 2) {
+        w = decodeWorkers[0];
+      } else {
+        const bgCount = decodeWorkers.length - 1;
+        w = decodeWorkers[1 + (nextWorkerIndex % bgCount)];
+        nextWorkerIndex++;
+      }
       // Bug found during smoke-testing (WebKit surfaced it as a 404 on
       // every request; the fallback path silently masked it in Chromium):
       // a relative URL passed into a Worker resolves against the WORKER
@@ -698,9 +745,9 @@ export function initStory() {
   }
   initDecodeWorkers();
 
-  async function decodeOne(url) {
+  async function decodeOne(url, urgent) {
     if (workerDecodeSupported) {
-      try { return await decodeInWorker(versioned(url)); } catch (e) { /* fall through to main-thread path below */ }
+      try { return await decodeInWorker(versioned(url), undefined, undefined, urgent); } catch (e) { /* fall through to main-thread path below */ }
     }
     try {
       const res = await fetch(versioned(url));
@@ -717,9 +764,9 @@ export function initStory() {
   // uploading a full 2048x1365 texture — e.g. a hold layer with map or dirty
   // pixels that's shown on a 1440px canvas — when the canvas is smaller).
   // Never upscales: a source already at or below the cap is used as-is.
-  async function decodeOneCapped(url, maxW, maxH) {
+  async function decodeOneCapped(url, maxW, maxH, urgent) {
     if (workerDecodeSupported) {
-      try { return await decodeInWorker(versioned(url), maxW, maxH); } catch (e) { /* fall through to main-thread path below */ }
+      try { return await decodeInWorker(versioned(url), maxW, maxH, urgent); } catch (e) { /* fall through to main-thread path below */ }
     }
     try {
       const res = await fetch(versioned(url));
@@ -800,7 +847,7 @@ export function initStory() {
   // "close" — bareSeg. `targetCache`/`cacheSeg` let a caller load into a
   // non-live cache instance under its own camera-namespaced key (see
   // switchCamera) without touching the currently-displayed frames.
-  async function loadSeqFrame(base, bareSeg, i, count, targetCache = cache, cacheSeg = segKey(bareSeg)) {
+  async function loadSeqFrame(base, bareSeg, i, count, targetCache = cache, cacheSeg = segKey(bareSeg), urgent = false) {
     if (targetCache.has(cacheSeg, i)) return;
     // CS-03 hard ceiling: a background (non-essential) load is skipped once
     // total resident bytes hit MAX_TOTAL_BYTES. Protected/in-window frames
@@ -814,8 +861,8 @@ export function initStory() {
     const idxStr = String(i).padStart(3, "0");
     const url = `${base}/${bareSeg}/${idxStr}.webp`;
     const bm = bareSeg === "sweep"
-      ? await (() => { const { w, h } = sweepCapDims(); return decodeOneCapped(url, w, h); })()
-      : await decodeOne(url);
+      ? await (() => { const { w, h } = sweepCapDims(); return decodeOneCapped(url, w, h, urgent); })()
+      : await decodeOne(url, urgent);
     if (bm) {
       targetCache.set(cacheSeg, i, bm);
       // Live-site lag fix: upload to the GPU here, at decode time, instead
@@ -905,7 +952,7 @@ export function initStory() {
   // progressive/readiness loaders also converging on the same frame.
   function priorityFetch(bareSeg, i, count) {
     if (!currentBase || !count) return;
-    loadSeqFrame(currentBase, bareSeg, i, count);
+    loadSeqFrame(currentBase, bareSeg, i, count, cache, segKey(bareSeg), true);
   }
 
   // Round 10: demand-driven priority queue, replacing the fixed loader
@@ -955,22 +1002,69 @@ export function initStory() {
     async function worker() {
       for (;;) {
         if (farOffscreen) return;
-        let bestIdx = -1, bestRank = Infinity;
+        let bestIdx = -1, bestRank = Infinity, anyPending = false;
         for (let k = 0; k < pending.length; k++) {
           const item = pending[k];
           if (!item) continue;
+          anyPending = true;
           const key = `${item.bareSeg}:${item.i}`;
           if (claimed.has(key)) continue;
           const rank = priorityRank(item.bareSeg, item.i);
           if (rank < bestRank) { bestRank = rank; bestIdx = k; }
         }
-        if (bestIdx === -1) return; // nothing left unclaimed (either done or all in-flight)
+        if (bestIdx === -1) {
+          // Root-caused a persistent hold that survived every earlier fix
+          // in this round (the byte-budget raise included): this used to
+          // `return` here unconditionally, permanently retiring the
+          // worker whenever everything currently unclaimed happened to
+          // be in flight on OTHER workers at that instant. Workers exit
+          // one by one as the queue drains, and since in-flight fetches
+          // are deliberately never cancelled, a later requeue (below,
+          // when a load completes but the frame still isn't resident --
+          // e.g. evicted by budget pressure) can land with ZERO workers
+          // left alive to ever notice it. Confirmed directly: a specific
+          // viewport's `close` segment stabilized on exactly the frames
+          // that happened to load before its last worker exited (cache
+          // endpoints + two incidental survivors), while the actively-
+          // needed frame sat re-queued and orphaned for the rest of the
+          // pass -- a ~1.1s hold once the user actually reached it,
+          // rescued only by resolveFrame()'s slow on-demand fetch.
+          // Fix: only exit once the queue is truly, structurally empty
+          // (no live entries at all); if items remain but are all
+          // momentarily claimed, wait briefly and re-poll instead of
+          // retiring, so a later requeue is always still being watched.
+          if (!anyPending) return;
+          await new Promise((resolve) => setTimeout(resolve, 40));
+          continue;
+        }
         const item = pending[bestIdx];
         const key = `${item.bareSeg}:${item.i}`;
         claimed.add(key);
         pending[bestIdx] = null;
         await loadSeqFrame(base, item.bareSeg, item.i, d[item.bareSeg], targetCache, keyFn(item.bareSeg));
         claimed.delete(key);
+        // Bug found while investigating a persistent hold that survived
+        // this priority queue's introduction (a viewport-specific case
+        // where `close` never got loaded before a reversal, even though
+        // it should have ranked first): loadSeqFrame() can return without
+        // the frame ever becoming resident (the MAX_TOTAL_BYTES ceiling
+        // check skips a non-essential decode once the budget's full) --
+        // but this loop unconditionally dropped it from `pending`
+        // (`pending[bestIdx] = null` above), permanently abandoning it
+        // for the rest of this pass. The ONLY thing that then ever
+        // rescued it was resolveFrame()'s slow, reactive, one-frame-at-a-
+        // time on-demand fetch once the user actually scrolled onto it --
+        // exactly matching the observed hold shape (several consecutive
+        // frames, each paying a full fetch+decode round trip in series).
+        // Re-queue instead of abandoning: if it's still not resident,
+        // push it back so a later pick (once eviction elsewhere frees
+        // ceiling headroom, or once it becomes the active/windowed frame
+        // and exempt from the ceiling) can retry it. A short backoff
+        // avoids the worker spinning tightly on a still-over-ceiling item.
+        if (!targetCache.has(keyFn(item.bareSeg), item.i)) {
+          pending.push(item);
+          await new Promise((resolve) => setTimeout(resolve, 60));
+        }
       }
     }
     const n = Math.max(1, Math.min(concurrency, pending.length || 1));
@@ -1295,10 +1389,28 @@ export function initStory() {
   // nothing has ever been drawn for this segment yet (first paint before
   // any frame has loaded), in which case the caller's existing hold-only
   // degrade applies.
+  //
+  // Round 10: this docstring's "prioritizes a direct fetch of the exact
+  // missing frame" was NOT actually true whenever a WINDOW_RADIUS-nearby
+  // substitute existed -- the early `if (bitmap) return bitmap` below
+  // returned the substitute WITHOUT ever calling priorityFetch for the
+  // real requested frame, since `bitmap` (from getCachedFrame's bounded-
+  // nearest lookup) is truthy as soon as ANY frame within radius 6 is
+  // resident. Root-caused a persistent, exactly-reproducible ~1.1s hold
+  // this way: a segment's permanently-protected endpoint (always
+  // resident) sits within radius 6 of several frames, so the engine
+  // silently substituted it and NEVER asked for the real one -- and
+  // since the one-shot background priority queue (priorityLoadAll) had
+  // already finished its pass by the time the user reached that
+  // position, nothing else was ever going to fetch it either. Fix:
+  // always fetch the EXACT frame on demand when it isn't resident,
+  // independent of whether a nearby substitute was found for display --
+  // "what to show right now" and "what to make resident" are separate
+  // concerns; conflating them is what caused this.
   function resolveFrame(bareSeg, frame, count) {
+    if (!cache.has(segKey(bareSeg), frame)) priorityFetch(bareSeg, frame, count);
     const bitmap = getCachedFrame(bareSeg, frame, count);
     if (bitmap) { lastGood[bareSeg] = bitmap; return bitmap; }
-    priorityFetch(bareSeg, frame, count);
     return lastGood[bareSeg];
   }
 
@@ -1901,6 +2013,9 @@ export function initStory() {
         sweepLoaded: (dims && dims.sweep ? Array.from({ length: dims.sweep }, (_, i) => cache.has(segKey("sweep"), i)) : []),
         protectedKeys: Array.from(cache.protectedKeys),
         switchingCamera,
+        farOffscreen,
+        workerDecodeSupported,
+        decodeWorkerCount: decodeWorkers.length,
         // CS-03: explicit memory accounting — decoded FrameCache bitmap
         // bytes, the fixed hold-layer bitmap estimate (0 once uploaded to
         // GL and released — see loadHoldLayers callers), the byte budget,
