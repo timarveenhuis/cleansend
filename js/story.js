@@ -192,24 +192,37 @@ const FOCUS_PHONE = { x: 0.5, y: 0.52 };
 // arrive/close/open decoded bitmaps is the look-ahead window
 // (maintainDecodeWindow/evictOutsideWindow), sized DECODE_WINDOW_BACK+
 // DECODE_WINDOW_FORWARD+1 = 19 frames max for one active segment.
-// Raised from the old priority-queue era's 20/64MB (sized for a shared
-// LRU budget across all four sequences at once) to comfortably exceed
-// the window's own natural size, so this backstop essentially never
-// fires in normal operation -- it only matters if something goes
-// genuinely wrong (e.g. windows briefly overlapping during a fast
-// segment transition).
+// Backstop for the look-ahead window (max 19 frames/segment); see
+// MAX_RESIDENT_BYTES below for why 45 is generous but not the binding
+// constraint in practice (bytes bind first at normal desktop canvas
+// widths).
 const MAX_RESIDENT_FRAMES = 45;
 // CS-03: explicit decoded-memory byte budget for the non-protected
 // sliding window, ON TOP OF the frame-count budget above — whichever is
-// stricter wins. Sized to comfortably hold the look-ahead window (19
-// frames) at the LARGER of the two desktop resolutions this engine
-// ships (full 1536x1024, ~6.29MB/frame -> ~120MB for 19 frames) with
-// margin, while still leaving real headroom under the 180MB
-// MAX_TOTAL_BYTES ceiling: measured fixed/protected overhead (sweep,
-// capped via sweepCapDims, + the 6 arrive/close/open endpoints) is only
-// ~35MB (qa/.../stream-a/scripts/memory-before-after.mjs), so 120MB
-// non-protected keeps the worst case ~155MB, comfortably under 180MB.
-const MAX_RESIDENT_BYTES = 120 * 1024 * 1024;
+// stricter wins.
+//
+// Correction (release 9 live measurement, qa/.../stream-a/lag/
+// release9/): an earlier version of this comment assumed sweepCapDims
+// kept sweep's decoded size well below d1024's own ~2.8MB/frame --
+// WRONG. sweepCapDims computes width as canvasWidth*0.75 capped to
+// 1024px, so at a normal ~1440px-wide desktop canvas it hits that 1024
+// cap directly -- sweep decodes at essentially the SAME resolution as
+// d1024 sequence frames, not a smaller one. Measured directly
+// (dig-ceiling-breakdown2.mjs): the fixed protected floor (24 sweep +
+// 6 arrive/close/open endpoints, all ~2.8MB each at d1024) is
+// ~84-115MB, not the ~35MB this comment previously claimed -- and
+// since protected loads are EXEMPT from the MAX_TOTAL_BYTES ceiling
+// check (they're load-bearing, never optional), a too-generous
+// non-protected budget here left real live overshoot (184-189MB peak
+// vs the 180MB ceiling, trackpad cadence). Lowered from 120MB to 50MB
+// -- 180 - ~115MB (protected, conservative) - ~15MB margin -- verified
+// directly to keep peak cacheBytes under 180MB under the same load
+// that previously overshot it. Slightly under one full 19-frame window
+// (~53MB) at d1024, so the window may fill a frame or two short of its
+// full radius under sustained memory pressure -- an acceptable,
+// self-correcting trade-off (resolveFrame still decodes the exact
+// current frame on demand regardless) versus breaching the ceiling.
+const MAX_RESIDENT_BYTES = 50 * 1024 * 1024;
 // CS-03 hard ceiling: a genuine cap on TOTAL decoded bytes (protected +
 // non-protected), unlike MAX_RESIDENT_BYTES above which only ever bounded
 // the non-protected slice. With sweep capped to <=1024x683 (see
@@ -219,6 +232,12 @@ const MAX_RESIDENT_BYTES = 120 * 1024 * 1024;
 // should stay comfortably under this (measured worst case ~155MB).
 // Enforced in loadSeqFrame as a hard stop-everything backstop.
 const MAX_TOTAL_BYTES = 180 * 1024 * 1024;
+// A smaller residual margin for the genuine (but much less significant
+// once MAX_RESIDENT_BYTES above was corrected) concurrent-worker race
+// on the non-protected side: a handful of decode workers can pass the
+// ceiling check reading the same pre-increment `bytes` before any of
+// them commits via set().
+const CEILING_SAFETY_MARGIN = 15 * 1024 * 1024;
 const bitmapBytes = (bm) => (bm && bm.width && bm.height ? bm.width * bm.height * 4 : 0);
 
 function fmtTime(s) {
@@ -882,7 +901,16 @@ export function initStory() {
     // in normal operation keeps well under this on its own -- this just
     // guards against a pathological case (many segments' windows
     // overlapping at once, e.g. mid camera-switch) blowing the ceiling.
-    if (!targetCache._isProtected(key) && targetCache.bytes >= MAX_TOTAL_BYTES) return;
+    // Live release 9 measurement found a real, reproducible overshoot
+    // past MAX_TOTAL_BYTES (peak 189.4MB vs the 180MB ceiling, trackpad
+    // cadence, qa/.../stream-a/lag/release9/): several concurrent decode
+    // workers (up to 6 in maintainDecodeWindow, another 6 in
+    // decodeAllSweep) can all pass this check reading the SAME
+    // pre-increment `bytes` before any of them commits via set() -- the
+    // check itself is correct but not atomic across concurrent callers.
+    // CEILING_SAFETY_MARGIN accounts for the worst realistic burst (a
+    // handful of full-res 1536px frames landing together, ~6.3MB each).
+    if (!targetCache._isProtected(key) && targetCache.bytes >= MAX_TOTAL_BYTES - CEILING_SAFETY_MARGIN) return;
     const idxStr = String(i).padStart(3, "0");
     const url = `${base}/${bareSeg}/${idxStr}.webp`;
     const bm = bareSeg === "sweep"
