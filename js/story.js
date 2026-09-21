@@ -164,6 +164,18 @@ const MAX_RESIDENT_FRAMES = 20;
 // higher-resolution asset regenerate silently blowing the memory budget
 // even while staying under the frame-count cap).
 const MAX_RESIDENT_BYTES = 40 * 1024 * 1024;
+// CS-03 hard ceiling: a genuine cap on TOTAL decoded bytes (protected +
+// non-protected), unlike MAX_RESIDENT_BYTES above which only ever bounded
+// the non-protected LRU slice. With sweep capped to <=1024x683 (see
+// sweepCapDims — was the single largest fixed contributor at full
+// 1536x1024x24 frames, ~151MB), the fixed protected floor (24 sweep +
+// close/open/arrive endpoints) plus the 40MB LRU budget should stay
+// comfortably under this. Enforced in loadSeqFrame: a NON-PROTECTED
+// background load (arrive/open progressive prefetch — never a protected
+// or in-window frame, which are load-bearing for correctness) is skipped
+// once total resident bytes reach this ceiling, and retried on the next
+// progressive pass once eviction frees room.
+const MAX_TOTAL_BYTES = 180 * 1024 * 1024;
 const bitmapBytes = (bm) => (bm && bm.width && bm.height ? bm.width * bm.height * 4 : 0);
 
 function fmtTime(s) {
@@ -598,14 +610,47 @@ export function initStory() {
     return out;
   }
 
+  // CS-03 memory ceiling: sweep is only ever composited as a soft, blended
+  // "working light" overlay (see drawHold's sweepTex/sweepMix), never
+  // shown at full opacity/detail the way arrive/close/open frames are — so
+  // unlike those, it doesn't need full 1536x1024 decode resolution. All 24
+  // sweep frames are PERMANENTLY protected (see pickDims's comment — the
+  // full-cycle protection that made CS-02's accounting bug possible in the
+  // first place), so they are the single largest fixed contributor to
+  // total decoded memory (~6.29MB x24 = ~151MB uncapped). Capping their
+  // decode size is a direct, bounded reduction of that fixed floor, unlike
+  // the LRU byte budget (MAX_RESIDENT_BYTES) which only ever bounded the
+  // non-protected slice. Formula intentionally more aggressive than
+  // loadHoldLayers' hold-layer cap (0.75x + a 480px floor, vs hold's 1.25x
+  // + 800px floor): a soft light glow tolerates more downscale than the
+  // map layer's sharp cleaning-front edge does.
+  function sweepCapDims() {
+    const floor = 480, ceil = 1024;
+    let w = Math.round((canvasEl.width || 1440) * 0.75);
+    w = Math.max(floor, Math.min(ceil, w));
+    const h = Math.round(w * (1024 / 1536)); // preserve the 1536x1024 source aspect
+    return { w, h };
+  }
   // `seg` here is the RAW (bare, un-namespaced) sequence name on disk, e.g.
   // "close" — bareSeg. `targetCache`/`cacheSeg` let a caller load into a
   // non-live cache instance under its own camera-namespaced key (see
   // switchCamera) without touching the currently-displayed frames.
   async function loadSeqFrame(base, bareSeg, i, count, targetCache = cache, cacheSeg = segKey(bareSeg)) {
     if (targetCache.has(cacheSeg, i)) return;
+    // CS-03 hard ceiling: a background (non-essential) load is skipped once
+    // total resident bytes hit MAX_TOTAL_BYTES. Protected/in-window frames
+    // (endpoints, sweep, the actively-viewed neighborhood) are exempt —
+    // they're load-bearing for correctness (see FrameCache._isProtected),
+    // not optional prefetch. Skipped frames are simply retried by whichever
+    // progressive/priority loader asked for them on its next pass, once
+    // eviction of older non-protected frames frees room.
+    const key = `${cacheSeg}:${i}`;
+    if (!targetCache._isProtected(key) && targetCache.bytes >= MAX_TOTAL_BYTES) return;
     const idxStr = String(i).padStart(3, "0");
-    const bm = await decodeOne(`${base}/${bareSeg}/${idxStr}.webp`);
+    const url = `${base}/${bareSeg}/${idxStr}.webp`;
+    const bm = bareSeg === "sweep"
+      ? await (() => { const { w, h } = sweepCapDims(); return decodeOneCapped(url, w, h); })()
+      : await decodeOne(url);
     if (bm) {
       targetCache.set(cacheSeg, i, bm);
       if (targetCache === cache) requestRender();
