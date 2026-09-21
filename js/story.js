@@ -1411,51 +1411,77 @@ export function initStory() {
     // is pure CSS calc() off the --chamber-* custom properties (percentage-
     // based, so resolution/scroll-independent) precisely to avoid this class
     // of bug — restore that instead of overriding it with a stale px snapshot.
+    let stale = false;
     if (mode === "side") {
       rail.style.left = ""; rail.style.top = ""; rail.style.transform = "";
-      return;
-    }
-    // "right"/"above" only trigger when the chamber is genuinely close to a
-    // viewport edge, which only happens while the section is actually near/
-    // in the viewport — but guard anyway: if the stage isn't currently
-    // intersecting the viewport at all, this call's snapshot can't be
-    // trusted (same staleness risk as above), so fall back to unclamped
-    // pure-CSS positioning rather than bake in a bad value.
-    if (stageRect.bottom < 0 || stageRect.top > vh) {
+    } else if (stageRect.bottom < 0 || stageRect.top > vh) {
+      // "right"/"above" only trigger when the chamber is genuinely close to
+      // a viewport edge, which only happens while the section is actually
+      // near/in the viewport — but guard anyway: if the stage isn't
+      // currently intersecting the viewport at all, this call's snapshot
+      // can't be trusted (same staleness risk as above), so fall back to
+      // unclamped pure-CSS positioning rather than bake in a bad value.
       rail.dataset.mode = "side";
       rail.style.left = ""; rail.style.top = ""; rail.style.transform = "";
-      return;
-    }
-    let railLeft, railTop, railTransform;
-    if (mode === "right") {
-      railLeft = vw - VIEWPORT_MARGIN - railWidth - stageRect.left;
-      railTop = chamberViewport.top + chamberViewport.height * 0.55 - stageRect.top;
-      railTransform = "translateY(-50%)";
+      stale = true;
     } else {
-      // above: right-aligned to the viewport margin, sitting just above the chamber's top edge
-      railLeft = vw - VIEWPORT_MARGIN - railWidth - stageRect.left;
-      railTop = chamberViewport.top - stageRect.top - railHeight - GAP;
-      railTransform = "none";
+      let railLeft, railTop, railTransform;
+      if (mode === "right") {
+        railLeft = vw - VIEWPORT_MARGIN - railWidth - stageRect.left;
+        railTop = chamberViewport.top + chamberViewport.height * 0.55 - stageRect.top;
+        railTransform = "translateY(-50%)";
+      } else {
+        // above: right-aligned to the viewport margin, sitting just above the chamber's top edge
+        railLeft = vw - VIEWPORT_MARGIN - railWidth - stageRect.left;
+        railTop = chamberViewport.top - stageRect.top - railHeight - GAP;
+        railTransform = "none";
+      }
+      // D. safe-box clamp: pull the rail's final viewport-space rect fully
+      // inside [headerBottom+16, vh-16] x [16, vw-16] — the "above" mode in
+      // particular can otherwise land partly under a tall header on short
+      // viewports. Convert to the rail's TOP-LEFT in viewport space first
+      // (collapsing the translateY(-50%) centring into a plain top offset),
+      // clamp that rect, then write it back as absolute left/top with no
+      // transform. This is only trustworthy because we just confirmed above
+      // that stageRect reflects the section's CURRENT on-screen position.
+      const header = document.querySelector(".site-header");
+      const headerBottom = header ? header.getBoundingClientRect().bottom : 0;
+      const safeTop = headerBottom + 16, safeBottom = vh - 16, safeLeft = 16, safeRight = vw - 16;
+      const centred = railTransform === "translateY(-50%)";
+      const railViewportLeft = stageRect.left + railLeft;
+      const railViewportTop = stageRect.top + railTop - (centred ? railHeight / 2 : 0);
+      const clampedLeft = clamp(railViewportLeft, safeLeft, Math.max(safeLeft, safeRight - railWidth));
+      const clampedTop = clamp(railViewportTop, safeTop, Math.max(safeTop, safeBottom - railHeight));
+      rail.style.left = `${clampedLeft - stageRect.left}px`;
+      rail.style.top = `${clampedTop - stageRect.top}px`;
+      rail.style.transform = "none";
     }
-    // D. safe-box clamp: pull the rail's final viewport-space rect fully
-    // inside [headerBottom+16, vh-16] x [16, vw-16] — the "above" mode in
-    // particular can otherwise land partly under a tall header on short
-    // viewports. Convert to the rail's TOP-LEFT in viewport space first
-    // (collapsing the translateY(-50%) centring into a plain top offset),
-    // clamp that rect, then write it back as absolute left/top with no
-    // transform. This is only trustworthy because we just confirmed above
-    // that stageRect reflects the section's CURRENT on-screen position.
-    const header = document.querySelector(".site-header");
-    const headerBottom = header ? header.getBoundingClientRect().bottom : 0;
-    const safeTop = headerBottom + 16, safeBottom = vh - 16, safeLeft = 16, safeRight = vw - 16;
-    const centred = railTransform === "translateY(-50%)";
-    const railViewportLeft = stageRect.left + railLeft;
-    const railViewportTop = stageRect.top + railTop - (centred ? railHeight / 2 : 0);
-    const clampedLeft = clamp(railViewportLeft, safeLeft, Math.max(safeLeft, safeRight - railWidth));
-    const clampedTop = clamp(railViewportTop, safeTop, Math.max(safeTop, safeBottom - railHeight));
-    rail.style.left = `${clampedLeft - stageRect.left}px`;
-    rail.style.top = `${clampedTop - stageRect.top}px`;
-    rail.style.transform = "none";
+
+    // Gate-3 defect 3 fix: whichever mode landed the rail (including plain
+    // CSS "side" positioning, which is chamber-relative and knows nothing
+    // about the skip button), do one final measured check against the
+    // actual rendered "Skip demonstration" button and push the rail clear
+    // of it if they intersect. A full 1024-1440px x 700/800/900/1000px
+    // sweep (Gate 3's own narrower report undersold the scope) found the
+    // rail overlapping the skip button across nearly the whole width range
+    // at height>=800, and overlapping the caption instead at height~700
+    // (short-landscape layout) — a general, mode-independent corrective
+    // check covers every case instead of chasing one more narrow band.
+    if (!stale && skipBtn && !isPhone && !isShortLandscape) {
+      const rr = rail.getBoundingClientRect();
+      const sr = skipBtn.getBoundingClientRect();
+      const intersects = !(rr.right < sr.left || sr.right < rr.left || rr.bottom < sr.top || sr.bottom < rr.top);
+      if (intersects) {
+        const stageRectNow = stage.getBoundingClientRect();
+        const pushedTop = sr.bottom + 16; // clear of the skip button, viewport space
+        const railViewportLeftNow = rr.left; // keep whatever horizontal placement the chosen mode already gave it
+        const safeRight = vw - 16;
+        const clampedLeftNow = clamp(railViewportLeftNow, 16, Math.max(16, safeRight - railWidth));
+        rail.style.left = `${clampedLeftNow - stageRectNow.left}px`;
+        rail.style.top = `${pushedTop - stageRectNow.top}px`;
+        rail.style.transform = "none";
+      }
+    }
   }
 
   // Desktop only: the caption box is fixed bottom-left per spec, but its
@@ -1507,8 +1533,22 @@ export function initStory() {
       const MIN_CAPTION_H = 96;
       const tallest = measureTallestCaption();
       if (tallest > 0) root.style.setProperty("--se-caption-h", `${Math.max(MIN_CAPTION_H, tallest)}px`);
+      // Gate-3 defect 3 fix (captions x rail): in short-landscape mode
+      // css/story.css floats .se-rail on top of the caption row via
+      // position:absolute (right/bottom) — the caption row itself is
+      // `inset:0`, i.e. its OUTER box (solid --mineral background) always
+      // spans the full band regardless of its own padding, so the rail's
+      // opaque pill genuinely sits on top of the caption's opaque
+      // background at that width x height range — confirmed by geometry
+      // sweep, not just a text-reflow issue. Shrink the caption row's own
+      // right edge (override the `right:0` half of the stylesheet's
+      // `inset:0` with an inline longhand, which wins the cascade) by the
+      // rail's real rendered width, so the two boxes never touch.
+      const railW = isShortLandscape && rail ? rail.getBoundingClientRect().width : 0;
+      captions.forEach((el) => { el.style.right = railW > 0 ? `${railW + 16}px` : ""; });
       return;
     }
+    captions.forEach((el) => { el.style.right = ""; });
     const stageRect = stage.getBoundingClientRect();
     const c = chamberToCss(stageRect.width, stageRect.height, dims.chamber, texAspect, getFocus());
     const chamberViewport = { left: stageRect.left + c.left, top: stageRect.top + c.top, right: stageRect.left + c.left + c.width, bottom: stageRect.top + c.top + c.height };
