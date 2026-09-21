@@ -317,6 +317,23 @@ class FrameCache {
       const i = center + d;
       if (i >= 0) this.windowKeys.add(`${seg}:${i}`);
     }
+    // Root-caused a real, sustained (not transient) budget violation this
+    // round: _evictIfNeeded() was only ever called from set(), but moving
+    // the window here can itself push the LIVE non-protected count over
+    // budget -- clearing the OLD window un-protects whatever it used to
+    // cover, and those entries count against the budget again the moment
+    // _liveNonProtectedCount() is next computed, with no new set() call
+    // to trigger a re-check. Previously this self-corrected quickly
+    // because background loading was still adding new frames (each its
+    // own set()) throughout a scroll pass; with round 10's early/eager
+    // loading now front-loading nearly everything before the user even
+    // starts scrolling, there can be long stretches with no further
+    // set() calls at all to ever catch a window-shift's silent overshoot
+    // -- confirmed directly (qa/.../stream-a/logs/cache-and-readiness-
+    // results.json): nonProtectedLiveCount sitting at 21-26 against a
+    // budget of 20 for a sustained span of scroll positions, not a
+    // one-sample blip. Re-check the budget here too, not just on add.
+    this._evictIfNeeded();
   }
   _isProtected(key) { return this.protectedKeys.has(key) || this.windowKeys.has(key); }
   _slot(seg) { if (!this.slots[seg]) this.slots[seg] = []; return this.slots[seg]; }
