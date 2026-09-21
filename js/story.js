@@ -22,6 +22,13 @@ import { StoryGL } from "./story-gl.js";
 const gsap = window.gsap;
 const ScrollTrigger = window.ScrollTrigger;
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+// Gate 1 requirement: diagnostics must never be on by default in
+// production. `window.__story` (test-only state/debug hooks, incl. pixel-
+// accuracy readback) is now only installed when explicitly requested via
+// ?csdiag=1 or localStorage csdiag=1 — a default load exposes nothing.
+const DIAG = /(?:^|[?&])csdiag=1(?:&|$)/.test(location.search) || (() => {
+  try { return localStorage.getItem("csdiag") === "1"; } catch (e) { return false; }
+})();
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -148,6 +155,16 @@ const OPEN_EXP = 1.0;
 const FOCUS_DESKTOP = { x: 0.5, y: 0.60 };
 const FOCUS_PHONE = { x: 0.5, y: 0.52 };
 const MAX_RESIDENT_FRAMES = 20;
+// CS-03: explicit decoded-memory byte budget for the non-protected sliding
+// window, ON TOP OF the frame-count budget above — whichever is stricter
+// wins. A decoded 1536x1024 RGBA frame is ~6.29MB (1536*1024*4); 40MB is
+// room for roughly the 20-frame count budget's worth at that resolution
+// (the frame-count budget is normally the binding constraint at this
+// resolution — the byte budget exists as a hard backstop against a future
+// higher-resolution asset regenerate silently blowing the memory budget
+// even while staying under the frame-count cap).
+const MAX_RESIDENT_BYTES = 40 * 1024 * 1024;
+const bitmapBytes = (bm) => (bm && bm.width && bm.height ? bm.width * bm.height * 4 : 0);
 
 function fmtTime(s) {
   s = Math.round(s);
@@ -193,8 +210,10 @@ function coverUvGl(texAspect, stageW, stageH, focus) {
 class FrameCache {
   // Sliding-window bitmap cache shared across arrive/close/open. Hold layers
   // are managed separately (always resident as GL textures).
-  constructor(max = MAX_RESIDENT_FRAMES) {
+  constructor(max = MAX_RESIDENT_FRAMES, maxBytes = MAX_RESIDENT_BYTES) {
     this.max = max;
+    this.maxBytes = maxBytes; // explicit decoded-memory byte budget (CS-03)
+    this.bytes = 0; // sum of (width*height*4) for every currently-resident bitmap, protected included
     this.slots = { arrive: [], close: [], open: [], sweep: [] };
     this.order = []; // MRU at the end, as "seg:i" keys
     this.onEvict = null;
@@ -251,8 +270,15 @@ class FrameCache {
   set(seg, i, bitmap) {
     if (this._slot(seg)[i]) return;
     this._slot(seg)[i] = bitmap;
+    this.bytes += bitmapBytes(bitmap);
     this._touch(seg, i);
     this._evictIfNeeded();
+  }
+  _dropBitmap(seg, i, bitmap) {
+    this._slot(seg)[i] = null;
+    this.bytes -= bitmapBytes(bitmap);
+    if (this.onEvict) this.onEvict(bitmap);
+    if (bitmap.close) bitmap.close();
   }
   _touch(seg, i) {
     const key = `${seg}:${i}`;
@@ -276,10 +302,24 @@ class FrameCache {
     for (const key of this.order) if (!this._isProtected(key)) n++;
     return n;
   }
+  // Byte budget applies only to the non-protected count's own bytes (same
+  // scope as the frame-count budget — protected frames are fixed overhead,
+  // never evicted here either way) so the two budgets are directly
+  // comparable/combinable rather than one silently overriding the other.
+  _nonProtectedBytes() {
+    let b = 0;
+    for (const key of this.order) {
+      if (this._isProtected(key)) continue;
+      const [seg, iStr] = key.split(":");
+      b += bitmapBytes(this._slot(seg)[Number(iStr)]);
+    }
+    return b;
+  }
   _evictIfNeeded() {
     let liveCount = this._liveNonProtectedCount();
+    let liveBytes = this._nonProtectedBytes();
     let cursor = 0;
-    while (liveCount > this.max && cursor < this.order.length) {
+    while ((liveCount > this.max || liveBytes > this.maxBytes) && cursor < this.order.length) {
       const key = this.order[cursor];
       if (this._isProtected(key)) { cursor++; continue; }
       this.order.splice(cursor, 1);
@@ -287,9 +327,8 @@ class FrameCache {
       const i = Number(iStr);
       const bitmap = this._slot(seg)[i];
       if (bitmap) {
-        this._slot(seg)[i] = null;
-        if (this.onEvict) this.onEvict(bitmap);
-        if (bitmap.close) bitmap.close();
+        liveBytes -= bitmapBytes(bitmap);
+        this._dropBitmap(seg, i, bitmap);
       }
       liveCount--;
       // cursor NOT incremented: the splice already shifted the next
@@ -325,11 +364,7 @@ class FrameCache {
         const [seg, iStr] = key.split(":");
         const i = Number(iStr);
         const bitmap = this._slot(seg)[i];
-        if (bitmap) {
-          this._slot(seg)[i] = null;
-          if (this.onEvict) this.onEvict(bitmap);
-          if (bitmap.close) bitmap.close();
-        }
+        if (bitmap) this._dropBitmap(seg, i, bitmap);
       } else keep.push(key);
     }
     this.order = keep;
@@ -337,14 +372,22 @@ class FrameCache {
   }
   clearAll() {
     Object.keys(this.slots).forEach((seg) => {
-      this.slots[seg].forEach((b) => { if (b) { if (this.onEvict) this.onEvict(b); if (b.close) b.close(); } });
+      this.slots[seg].forEach((b, i) => { if (b) this._dropBitmap(seg, i, b); });
       this.slots[seg] = [];
     });
     this.order = [];
+    this.bytes = 0;
     this.protectedKeys.clear(); // pickDims() re-registers these for the new breakpoint right after
     this.windowKeys.clear();
   }
 }
+
+// CS-02: exported (additive, no behavior change) so FrameCache's eviction/
+// protection/nearest-fallback invariants can be unit-tested directly
+// against the real class, not a hand-copied re-implementation that could
+// drift out of sync. See qa/final-2026-09-21/stream-a/scripts/
+// frame-cache.test.mjs.
+export { FrameCache, MAX_RESIDENT_FRAMES, MAX_RESIDENT_BYTES };
 
 export function initStory() {
   const root = document.querySelector("[data-story]");
@@ -396,7 +439,7 @@ export function initStory() {
   function goStatic(reason) {
     root.classList.add("is-static");
     if (statusEl && statusSteps.length) statusEl.textContent = statusSteps[statusSteps.length - 1].text;
-    window.__story = { state: () => ({ ready: false, staticFallback: true, reason }) };
+    if (DIAG) window.__story = { state: () => ({ ready: false, staticFallback: true, reason }) };
   }
 
   // Reduced motion always gets the static beats. Missing GSAP/ScrollTrigger,
@@ -467,6 +510,12 @@ export function initStory() {
   let ready = false; // hold + close loaded
   let loadingStarted = false;
   let midStillBitmap = null; // P1 fix: small baked-050 standby, see updateUI
+  // CS-03: decoded-byte estimate for the 6 always-resident hold-layer
+  // bitmaps (not tracked by FrameCache, which only covers arrive/close/
+  // open/sweep) — updated wherever hold layers are (re)assigned, exposed
+  // via debugCacheInfo for peak-memory reporting.
+  let holdBytesEstimate = 0;
+  const sumHoldBytes = (hold) => Object.values(hold || {}).reduce((s, bm) => s + bitmapBytes(bm), 0);
 
   let lastState = { p: 0, seg: "dirty", frame: 0, L: 0, c: 0, mist: 0, timer: "0:00", locked: false, status: "", ready: false };
   let mistClock = 0;
@@ -658,6 +707,13 @@ export function initStory() {
       glCtx.setHoldLayer("cleanOff", hold["clean-off"]);
       glCtx.setHoldLayer("map", hold["map"]);
       glCtx.setHoldLayer("window", hold["window"]);
+      // CS-03: hold-layer bitmaps are copied into fixed, reused GL textures
+      // by setHoldLayer's texImage2D upload above — the CPU-side decoded
+      // ImageBitmap is never read again after that, so release it
+      // immediately (deterministic, not left to GC) rather than holding
+      // both the GPU texture AND the CPU decode resident.
+      Object.values(hold).forEach((bm) => { if (bm && bm.close) bm.close(); });
+      holdBytesEstimate = 0; // freed above; hold-layer memory now lives only in the 6 fixed GL textures
       // real tileable mist noise (engine-level asset, not per-shot)
       Promise.all([
         decodeOne("assets/gl/noise-a.png"),
@@ -667,22 +723,33 @@ export function initStory() {
     } else {
       holdImgs2d = hold;
       holdImgs2d.baked = await loadBakedFallback(base);
+      holdBytesEstimate = sumHoldBytes(hold) + sumHoldBytes(holdImgs2d.baked); // 2D fallback keeps these resident, unlike the GL path
     }
 
-    // close must be fully loaded before "ready" (spec: hold + close gate
-    // readiness). If the manifest doesn't list a close count yet (hold-only
-    // mode — sequences not rendered yet), dims.close is undefined and this
-    // loop is simply zero iterations: readiness only ever waits on what's
-    // actually promised, never blocks on a sequence that doesn't exist.
-    await loadSeqFramesConcurrent(base, "close", dims.close);
-    closeReady = true;
-    // sweep (working-light) starts mattering at p=0.36, right after hold
-    // begins (0.32) — load it fully alongside close, before ready, rather
-    // than progressively: unlike arrive/open it's small (24 frames, same
-    // budget as close) and needed almost immediately into the hold, not
-    // traversed once at the far end of the timeline. A missing manifest
-    // count (older asset set) makes this loop a no-op, same pattern as close.
-    await loadSeqFramesConcurrent(base, "sweep", dims.sweep);
+    // CS-03 retune: readiness previously gated on the FULL close (24
+    // frames) AND FULL sweep (24 frames) sequences fully decoded before the
+    // canvas could render anything — a multi-second synchronous wait on a
+    // slow connection, even though most of those frames won't be seen for
+    // many seconds of scroll (or a direction the user never takes). Now
+    // that resolveFrame() (see below) holds the last coherent frame and
+    // priority-refetches on any cache miss instead of ever jumping to a
+    // distant frame, it's safe to gate readiness on a MUCH smaller set:
+    // hold layers (already awaited above) plus a small neighborhood of
+    // close frames around wherever the current scroll position actually
+    // needs (usually 0/none on a fresh load — reload-with-restored-scroll
+    // is the case where this matters) plus both continuity endpoints. The
+    // remainder of close, all of sweep, arrive and open continue loading
+    // in the background afterward, concurrently and non-blocking.
+    if (dims.close) {
+      const cur = computeState(lastState.p);
+      const center = cur.seg === "close" ? cur.frame : 0;
+      const essential = new Set([0, dims.close - 1]);
+      for (let d = -WINDOW_RADIUS; d <= WINDOW_RADIUS; d++) {
+        const i = center + d;
+        if (i >= 0 && i < dims.close) essential.add(i);
+      }
+      await Promise.all(Array.from(essential, (i) => loadSeqFrame(base, "close", i, dims.close)));
+    }
     ready = true;
     root.classList.add("is-ready");
     // P1 fix: cross-fade the canvas in over 300ms from whatever still was
@@ -696,9 +763,12 @@ export function initStory() {
     }
     requestRender();
 
-    // background: arrive + open, progressive, non-blocking (no-ops when the
-    // manifest has no count for them — drawCanvas() then uses the hold-only
-    // degrade for those segments instead of a sequence frame)
+    // background: the rest of close, all of sweep, arrive and open —
+    // concurrent (not sequential/blocking each other) and non-blocking of
+    // `ready`. loadSeqFrame's own cache.has() check makes re-requesting the
+    // already-preloaded close neighborhood above a harmless no-op.
+    if (dims.close) loadSeqProgressive(base, "close", dims.close).then(() => { closeReady = true; });
+    if (dims.sweep) loadSeqFramesConcurrent(base, "sweep", dims.sweep);
     if (dims.arrive) loadSeqProgressive(base, "arrive", dims.arrive);
     if (dims.open) loadSeqProgressive(base, "open", dims.open);
   }
@@ -1344,6 +1414,7 @@ export function initStory() {
     lastState = state;
     drawCanvas(state, force);
     updateUI(state);
+    if (!DIAG) return;
     window.__story = {
       state: () => ({ ...lastState }),
       // test-only: draw once at `p` with `mist` forced to a specific value
@@ -1396,6 +1467,22 @@ export function initStory() {
         sweepLoaded: (dims && dims.sweep ? Array.from({ length: dims.sweep }, (_, i) => cache.has(segKey("sweep"), i)) : []),
         protectedKeys: Array.from(cache.protectedKeys),
         switchingCamera,
+        // CS-03: explicit memory accounting — decoded FrameCache bitmap
+        // bytes, the fixed hold-layer bitmap estimate (0 once uploaded to
+        // GL and released — see loadHoldLayers callers), the byte budget,
+        // and the live GL texture count (StoryGL self-caps at 24 for
+        // sequence-frame textures; hold layers are a separate fixed 6).
+        // NOTE: cacheBytes is the TOTAL decoded footprint (protected +
+        // non-protected). nonProtectedMaxBytes only bounds the LRU
+        // (non-protected) slice, same scope as the frame-count budget —
+        // it does NOT bound the fixed protected overhead (all 24 sweep
+        // frames + 6 endpoints, ~144MB+ at this resolution), which is a
+        // known, unresolved limitation — see status/stream-a.md.
+        cacheBytes: cache.bytes,
+        nonProtectedBytes: cache._nonProtectedBytes(),
+        nonProtectedMaxBytes: cache.maxBytes,
+        holdBytesEstimate,
+        glFrameTextureCount: glCtx ? glCtx.frameTexOrder.length : null,
       }),
       // test-only: draw whatever bitmap is actually stored in the cache for
       // (bareSeg,i) to a small canvas and return a pixel sample, to verify
@@ -1487,8 +1574,22 @@ export function initStory() {
       if (targetDims.close) cache.setProtected(targetPrefix + "close", [0, targetDims.close - 1]);
       if (targetDims.open) cache.setProtected(targetPrefix + "open", [0, targetDims.open - 1]);
       if (targetDims.sweep) cache.setProtected(targetPrefix + "sweep", Array.from({ length: targetDims.sweep }, (_, i) => i));
-      await loadSeqFramesConcurrent(targetBase, "close", targetDims.close, cache, 5, targetPrefix + "close");
-      await loadSeqFramesConcurrent(targetBase, "sweep", targetDims.sweep, cache, 5, targetPrefix + "sweep");
+      // CS-03/CS-05 retune: mirror startLoading()'s reduced-readiness set —
+      // only the close neighborhood around the CURRENT progress (the user
+      // is actively mid-story during a live camera switch, so this matters
+      // more here than on a fresh load) plus endpoints, not the full 24
+      // frames, before the swap goes live. Sweep and the rest of close
+      // continue in the background after the swap (below).
+      if (targetDims.close) {
+        const cur = computeState(lastState.p);
+        const center = cur.seg === "close" ? cur.frame : 0;
+        const essential = new Set([0, targetDims.close - 1]);
+        for (let d = -WINDOW_RADIUS; d <= WINDOW_RADIUS; d++) {
+          const i = center + d;
+          if (i >= 0 && i < targetDims.close) essential.add(i);
+        }
+        await Promise.all(Array.from(essential, (i) => loadSeqFrame(targetBase, "close", i, targetDims.close, cache, targetPrefix + "close")));
+      }
 
       // Atomic swap.
       useP = targetUseP;
@@ -1503,11 +1604,18 @@ export function initStory() {
         glCtx.setHoldLayer("cleanOff", switchHold["clean-off"]);
         glCtx.setHoldLayer("map", switchHold["map"]);
         glCtx.setHoldLayer("window", switchHold["window"]);
+        // CS-03: same as startLoading() — free the CPU-side decode right
+        // after the GL upload, not left to GC.
+        Object.values(switchHold).forEach((bm) => { if (bm && bm.close) bm.close(); });
+        holdBytesEstimate = 0;
       } else {
+        // release the OLD camera's 2D-fallback bitmaps before dropping the reference
+        Object.values(holdImgs2d).forEach((bm) => { if (bm && bm.close) bm.close(); else if (bm && typeof bm === "object") Object.values(bm).forEach((b) => b && b.close && b.close()); });
         holdImgs2d = switchHold;
         holdImgs2d.baked = await loadBakedFallback(targetBase);
+        holdBytesEstimate = sumHoldBytes(switchHold) + sumHoldBytes(holdImgs2d.baked);
       }
-      holdReady = true; closeReady = true; ready = true;
+      holdReady = true; ready = true;
       root.classList.add("is-ready");
       measureHeaderHeight(); positionRail(); positionCaptions();
       requestRender();
@@ -1516,6 +1624,8 @@ export function initStory() {
       // one is live, rather than holding both resident indefinitely.
       cache.evictPrefix(oldPrefix);
 
+      if (targetDims.close) loadSeqProgressive(targetBase, "close", targetDims.close, cache, targetPrefix + "close").then(() => { closeReady = true; });
+      if (targetDims.sweep) loadSeqFramesConcurrent(targetBase, "sweep", targetDims.sweep, cache, 5, targetPrefix + "sweep");
       if (targetDims.arrive) loadSeqProgressive(targetBase, "arrive", targetDims.arrive, cache, targetPrefix + "arrive");
       if (targetDims.open) loadSeqProgressive(targetBase, "open", targetDims.open, cache, targetPrefix + "open");
     } finally {
