@@ -376,12 +376,21 @@ export function initStory() {
     skipBtn.addEventListener("click", () => {
       const target = document.getElementById("outcomes");
       if (!target) return;
+      const heading = document.getElementById("outcomes-h");
       const header = document.querySelector(".site-header");
       const headerH = header ? header.getBoundingClientRect().height : 0;
-      // 16px margin below the header, matching the "at least 16px from
-      // viewport edges" rule applied to the story's own captions/rail.
-      const top = target.getBoundingClientRect().top + window.scrollY - headerH - 16;
-      const heading = document.getElementById("outcomes-h");
+      // Bug fix (CS-07): #outcomes (the section) starts above its own
+      // eyebrow paragraph, ABOVE #outcomes-h itself -- landing on the
+      // section's own top instead of the heading's undershoots by that
+      // eyebrow's height, which is small relative to a tall viewport but,
+      // confirmed in WebKit at 844x390, pushes the heading (739px down)
+      // entirely past a 390px-tall viewport. Target the heading's own
+      // position (falling back to the section if the heading is somehow
+      // missing) so it's the heading itself that lands 16px below the
+      // header, matching the "at least 16px from viewport edges" rule
+      // applied to the story's own captions/rail.
+      const anchor = heading || target;
+      const top = anchor.getBoundingClientRect().top + window.scrollY - headerH - 16;
       const focusHeading = () => {
         if (!heading) return;
         const hadTabindex = heading.hasAttribute("tabindex");
@@ -408,7 +417,27 @@ export function initStory() {
       // focus only once the scroll has actually settled.
       window.scrollTo({ top, behavior: "smooth" });
       let settled = false;
-      const settle = () => { if (settled) return; settled = true; focusHeading(); };
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        // Bug fix (CS-07): the target `top` above is computed from a
+        // snapshot taken before the scroll starts. Confirmed in WebKit at
+        // 844x390 landscape on a fresh load (before the pinned story's own
+        // ScrollTrigger has finished sizing its spacer): the document can
+        // still grow taller WHILE the smooth scroll is in flight, shifting
+        // #outcomes-h hundreds of px further down than where the scroll
+        // actually lands. Re-check the heading's real position once the
+        // scroll has settled and correct once, instantly, rather than
+        // trusting the pre-scroll snapshot.
+        if (heading) {
+          const wanted = headerH + 16;
+          const actual = heading.getBoundingClientRect().top;
+          if (Math.abs(actual - wanted) > 24) {
+            window.scrollTo({ top: window.scrollY + (actual - wanted), behavior: "auto" });
+          }
+        }
+        focusHeading();
+      };
       if ("onscrollend" in window) {
         window.addEventListener("scrollend", settle, { once: true });
       } else {
