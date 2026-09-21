@@ -983,16 +983,30 @@ export function initStory() {
     // HTTP/1.1 at 6 connections/origin; even under HTTP/2, four
     // simultaneous decode streams compete for the same main-thread
     // decode/upload time). `arrive` is needed almost immediately (it's the
-    // very next segment after the dirty-dissolve), `close` next, `sweep`
-    // only once `hold` is reached, `open` last — so run them SEQUENTIALLY
-    // in that viewing-order priority instead of all at once: each gets the
-    // full connection/decode budget for its own turn, sooner content loads
-    // sooner, without ever blocking `ready` above (this IIFE is fire-and-
-    // forget). loadSeqFrame's own cache.has() check makes re-requesting the
-    // already-preloaded close neighborhood above a harmless no-op.
+    // very next segment after the dirty-dissolve), `sweep` only once
+    // `hold` is reached, `open` last — so those still run in that
+    // viewing-order priority, without ever blocking `ready` above (this
+    // IIFE is fire-and-forget).
+    //
+    // Round 9 correction: `close` was ALSO put fully after `arrive` in
+    // that sequential chain, on the assumption it's needed strictly
+    // later. Measured directly against the live site with a corrected,
+    // wall-clock-accurate scroll harness: a REVERSAL back into `close`
+    // shortly after the forward pass found close's remainder essentially
+    // unloaded (a continuous ~1.1s hold, frames 6->1, only the readiness-
+    // time essential neighborhood present) — `close`'s full-sequence load
+    // hadn't even started yet, because `arrive` (36 frames) hadn't fully
+    // finished. A user who reverses direction early can reach `close`
+    // long before a strictly-sequential arrive-then-close chain gets
+    // there. Run `arrive` and `close` CONCURRENTLY instead (both are
+    // needed early — forward OR reversed), while still deferring
+    // `sweep`/`open` until both finish (they're only needed once `hold`/
+    // `open` are actually reached). loadSeqFrame's own cache.has() check
+    // makes re-requesting the already-preloaded close neighborhood above
+    // a harmless no-op.
     (async () => {
-      if (arriveLoadPromise) await arriveLoadPromise;
-      if (dims.close) { await loadSeqProgressive(base, "close", dims.close); closeReady = true; }
+      const closePromise = dims.close ? loadSeqProgressive(base, "close", dims.close).then(() => { closeReady = true; }) : null;
+      await Promise.all([arriveLoadPromise, closePromise]);
       if (dims.sweep) await loadSeqFramesConcurrent(base, "sweep", dims.sweep);
       if (dims.open) await loadSeqProgressive(base, "open", dims.open);
     })();
