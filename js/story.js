@@ -104,7 +104,39 @@ const TIMER_TOTAL_S = 4 * 60 + 52;
 // close's swing is). So unlike close, open does NOT need a remap on top —
 // a plain linear index already matches the footage; OPEN_EXP=1 makes the
 // power-curve formula below a no-op while keeping one code path for both.
-const CLOSE_EXP = 1.7;
+// CS-04 retune: CLOSE_EXP=1.7 was an unvalidated heuristic ("roughly 60% of
+// scroll distance to the first third of frames"). Replaced with the actual
+// measured cumulative visual distance between adjacent close frames — a
+// downsampled (64x64 grayscale) per-adjacent-frame RMS, cumulatively
+// summed and normalized to [0,1] — for each camera's real assets (see
+// qa/final-2026-09-21/stream-a/scripts/measure-frame-distance.mjs and its
+// logs/frame-distance-measurements.json; measured max deltas: d_close
+// 38.84, p_close 46.61, d_open 34.12, p_open 42.79 — consistent with the
+// contract's own reference numbers for the same audit method). Index i of
+// each array is the fraction of the close swing's TOTAL visual motion that
+// has occurred by the time frame i is reached; frameForCumulative() inverts
+// it (t -> continuous frame index) so uniform scroll now produces uniform
+// PERCEIVED door motion instead of uniform frame-count motion.
+const CLOSE_CUM = {
+  d: [0, 0.0867, 0.2037, 0.3062, 0.4136, 0.5102, 0.5873, 0.6467, 0.6942, 0.7358, 0.7728, 0.8031, 0.8287, 0.8523, 0.8742, 0.8971, 0.9194, 0.9388, 0.9561, 0.9712, 0.9831, 0.9918, 0.9975, 1],
+  p: [0, 0.068, 0.1795, 0.2868, 0.3957, 0.4877, 0.5588, 0.6167, 0.6694, 0.7177, 0.7538, 0.7806, 0.8081, 0.8353, 0.8617, 0.8867, 0.9109, 0.932, 0.9515, 0.9679, 0.9813, 0.9913, 0.9976, 1],
+};
+// Inverts a cumulative-distance table: given t in [0,1] (fraction of total
+// scroll-segment traversed), returns the continuous frame index whose
+// cumulative visual distance equals t (linear interpolation between the two
+// bracketing measured frames). Falls back to a plain linear map if the
+// table's frame count doesn't match the live asset count (e.g. a manifest
+// swap to a differently-sized sequence — keeps the engine correct even if
+// these constants ever drift out of sync with the assets on disk).
+function frameForCumulative(cum, t, count) {
+  if (!cum || cum.length !== count) return t * (count - 1);
+  t = clamp(t, 0, 1);
+  let i = 0;
+  while (i < cum.length - 1 && cum[i + 1] < t) i++;
+  const c0 = cum[i], c1 = cum[Math.min(i + 1, cum.length - 1)];
+  const frac = c1 > c0 ? (t - c0) / (c1 - c0) : 0;
+  return Math.min(count - 1, i + frac);
+}
 const OPEN_EXP = 1.0;
 // object-fit: cover focus point, fraction from the top. DIRECTION-v5 sets
 // 50%/52%, which works on phone (own camera, own compact rail below the
@@ -209,15 +241,16 @@ class FrameCache {
     }
   }
   _isProtected(key) { return this.protectedKeys.has(key) || this.windowKeys.has(key); }
-  has(seg, i) { return !!this.slots[seg][i]; }
+  _slot(seg) { if (!this.slots[seg]) this.slots[seg] = []; return this.slots[seg]; }
+  has(seg, i) { return !!this._slot(seg)[i]; }
   get(seg, i) {
-    const b = this.slots[seg][i];
+    const b = this._slot(seg)[i];
     if (b) this._touch(seg, i);
     return b || null;
   }
   set(seg, i, bitmap) {
-    if (this.slots[seg][i]) return;
-    this.slots[seg][i] = bitmap;
+    if (this._slot(seg)[i]) return;
+    this._slot(seg)[i] = bitmap;
     this._touch(seg, i);
     this._evictIfNeeded();
   }
@@ -227,10 +260,24 @@ class FrameCache {
     if (idx >= 0) this.order.splice(idx, 1);
     this.order.push(key);
   }
+  // CS-02 fix: the previous implementation seeded liveCount from
+  // this.order.length, which includes protected entries (permanently-
+  // protected endpoints/sweep frames AND the short-lived viewing-window
+  // frames). Once protected entries alone exceed `max` (24 sweep frames +
+  // 6 endpoints already does, against a nominal budget of 20), liveCount
+  // could never drop at or below max by evicting only non-protected keys,
+  // so eviction degenerated into "evict every non-protected frame it scans
+  // past" — confirmed directly: right after `ready`, only close[0]/
+  // close[23] survived out of 24. Fix: count only non-protected resident
+  // entries against the budget; protected entries are fixed overhead on
+  // top, never counted and never evicted here.
+  _liveNonProtectedCount() {
+    let n = 0;
+    for (const key of this.order) if (!this._isProtected(key)) n++;
+    return n;
+  }
   _evictIfNeeded() {
-    // count only non-protected entries against the budget: protected frames
-    // are a small, fixed overhead on top, not part of the sliding window
-    let liveCount = this.order.length;
+    let liveCount = this._liveNonProtectedCount();
     let cursor = 0;
     while (liveCount > this.max && cursor < this.order.length) {
       const key = this.order[cursor];
@@ -238,27 +285,58 @@ class FrameCache {
       this.order.splice(cursor, 1);
       const [seg, iStr] = key.split(":");
       const i = Number(iStr);
-      const bitmap = this.slots[seg][i];
+      const bitmap = this._slot(seg)[i];
       if (bitmap) {
-        this.slots[seg][i] = null;
+        this._slot(seg)[i] = null;
         if (this.onEvict) this.onEvict(bitmap);
         if (bitmap.close) bitmap.close();
       }
       liveCount--;
+      // cursor NOT incremented: the splice already shifted the next
+      // candidate into this position.
     }
   }
-  // nearest loaded index to `i` in segment `seg` (never returns null unless
-  // absolutely nothing is loaded for that segment).
-  nearest(seg, i, count) {
-    if (this.slots[seg][i]) return i;
-    for (let d = 1; d < count; d++) {
-      if (i - d >= 0 && this.slots[seg][i - d]) return i - d;
-      if (i + d < count && this.slots[seg][i + d]) return i + d;
+  // nearest loaded index to `i` in segment `seg`, bounded to `maxDist`
+  // steps away (default: unbounded, for callers that explicitly want the
+  // old "closest available, however far" behavior — e.g. the 2D fallback's
+  // very first paint). CS-02/CS-04 fix: the story engine itself now always
+  // passes a small bounded maxDist (see nearestProtected/WINDOW_RADIUS)
+  // so a missing frame can no longer resolve to a frame from deep in the
+  // sequence — once ready, an out-of-window miss returns null and the
+  // caller holds the last coherent frame instead (see drawCanvas).
+  nearest(seg, i, count, maxDist = Infinity) {
+    const slot = this._slot(seg);
+    if (slot[i]) return i;
+    for (let d = 1; d <= maxDist && d < count; d++) {
+      if (i - d >= 0 && slot[i - d]) return i - d;
+      if (i + d < count && slot[i + d]) return i + d;
     }
     return null;
   }
+  // Evict every resident (and protected) entry whose key starts with
+  // `prefix` — used to release one camera's frames once a breakpoint/
+  // camera switch has swapped a new, fully-loaded set into place (see
+  // switchCamera()), instead of blanking everything the instant the
+  // switch begins.
+  evictPrefix(prefix) {
+    const keep = [];
+    for (const key of this.order) {
+      if (key.startsWith(prefix)) {
+        const [seg, iStr] = key.split(":");
+        const i = Number(iStr);
+        const bitmap = this._slot(seg)[i];
+        if (bitmap) {
+          this._slot(seg)[i] = null;
+          if (this.onEvict) this.onEvict(bitmap);
+          if (bitmap.close) bitmap.close();
+        }
+      } else keep.push(key);
+    }
+    this.order = keep;
+    for (const key of Array.from(this.protectedKeys)) if (key.startsWith(prefix)) this.protectedKeys.delete(key);
+  }
   clearAll() {
-    ["arrive", "close", "open", "sweep"].forEach((seg) => {
+    Object.keys(this.slots).forEach((seg) => {
       this.slots[seg].forEach((b) => { if (b) { if (this.onEvict) this.onEvict(b); if (b.close) b.close(); } });
       this.slots[seg] = [];
     });
@@ -365,7 +443,21 @@ export function initStory() {
     return aspect < 0.95;
   }
 
-  const cache = new FrameCache(MAX_RESIDENT_FRAMES);
+  // CS-02/CS-05: `cache` is reassignable so switchCamera() can swap in a
+  // fully-loaded replacement atomically (see below); segKey() namespaces
+  // every seg key by the CURRENT live camera so a mid-switch load into a
+  // separate cache instance can never collide with / silently overwrite a
+  // resident frame from the other camera at the same numeric index.
+  let cache = new FrameCache(MAX_RESIDENT_FRAMES);
+  let currentBase = null; // seqBase + "/d" or "/p" for the LIVE camera; used by priority re-fetch
+  let switchingCamera = false;
+  const segKey = (seg) => (useP ? "p_" : "d_") + seg;
+  // last real, on-screen-coherent bitmap per bare segment name — held and
+  // redrawn (never left blank) whenever the exact/near requested frame
+  // isn't resident yet. Survives camera switches (see switchCamera): it is
+  // only ever replaced by another successfully-drawn frame, never cleared
+  // by a cache eviction.
+  const lastGood = { arrive: null, close: null, open: null };
   let glCtx = null; // StoryGL instance, if WebGL is available
   let ctx2d = null; // 2D fallback context
   let holdImgs2d = {}; // <img>/ImageBitmap for the 2D fallback path
@@ -457,25 +549,58 @@ export function initStory() {
     return out;
   }
 
-  async function loadSeqFrame(base, seg, i, count) {
-    if (cache.has(seg, i)) return;
+  // `seg` here is the RAW (bare, un-namespaced) sequence name on disk, e.g.
+  // "close" — bareSeg. `targetCache`/`cacheSeg` let a caller load into a
+  // non-live cache instance under its own camera-namespaced key (see
+  // switchCamera) without touching the currently-displayed frames.
+  async function loadSeqFrame(base, bareSeg, i, count, targetCache = cache, cacheSeg = segKey(bareSeg)) {
+    if (targetCache.has(cacheSeg, i)) return;
     const idxStr = String(i).padStart(3, "0");
-    const bm = await decodeOne(`${base}/${seg}/${idxStr}.webp`);
+    const bm = await decodeOne(`${base}/${bareSeg}/${idxStr}.webp`);
     if (bm) {
-      cache.set(seg, i, bm);
-      requestRender();
+      targetCache.set(cacheSeg, i, bm);
+      if (targetCache === cache) requestRender();
     }
   }
 
-  async function loadSeqProgressive(base, seg, count) {
+  async function loadSeqProgressive(base, bareSeg, count, targetCache = cache, cacheSeg = segKey(bareSeg)) {
     // every 4th frame first, then fill the rest
     const order = [];
     for (let i = 0; i < count; i += 4) order.push(i);
     for (let i = 0; i < count; i++) if (i % 4 !== 0) order.push(i);
     for (const i of order) {
       if (farOffscreen) return; // stop background fetch once we've scrolled far away
-      await loadSeqFrame(base, seg, i, count);
+      await loadSeqFrame(base, bareSeg, i, count, targetCache, cacheSeg);
     }
+  }
+
+  // CS-03 fix: readiness previously awaited each frame sequentially
+  // (concurrency 1) via a plain `for` + `await` loop, serializing what are
+  // independent network+decode operations. Bounded-concurrency pool (default
+  // 5, tunable) — same total work, decoded in parallel, cutting readiness
+  // wall-clock roughly by the concurrency factor on any connection where
+  // requests aren't already saturating a single-connection bottleneck.
+  async function loadSeqFramesConcurrent(base, bareSeg, count, targetCache = cache, concurrency = 5, cacheSeg = segKey(bareSeg)) {
+    if (!count) return;
+    let next = 0;
+    async function worker() {
+      while (next < count) {
+        const i = next++;
+        await loadSeqFrame(base, bareSeg, i, count, targetCache, cacheSeg);
+      }
+    }
+    const n = Math.max(1, Math.min(concurrency, count));
+    await Promise.all(Array.from({ length: n }, () => worker()));
+  }
+
+  // Priority re-fetch: called when drawCanvas needs a frame that isn't
+  // resident and isn't within the bounded nearest-frame window (see
+  // nearestProtected/WINDOW_RADIUS below). Fire-and-forget — loadSeqFrame's
+  // own cache.has() check makes this idempotent against the regular
+  // progressive/readiness loaders also converging on the same frame.
+  function priorityFetch(bareSeg, i, count) {
+    if (!currentBase || !count) return;
+    loadSeqFrame(currentBase, bareSeg, i, count);
   }
 
   async function startLoading() {
@@ -494,6 +619,7 @@ export function initStory() {
     positionRail(); // manifest.chamber is known now; the initial resizeCanvas() ran before this
     positionCaptions();
     const base = `${seqBase}/${useP ? "p" : "d"}`;
+    currentBase = base;
 
     // P1 fix: fetch the small baked-050 standby BEFORE the heavy hold
     // layers/close sequence (~1.6 MB+) so scrolling into the locked/
@@ -548,7 +674,7 @@ export function initStory() {
     // mode — sequences not rendered yet), dims.close is undefined and this
     // loop is simply zero iterations: readiness only ever waits on what's
     // actually promised, never blocks on a sequence that doesn't exist.
-    for (let i = 0; i < dims.close; i++) await loadSeqFrame(base, "close", i, dims.close);
+    await loadSeqFramesConcurrent(base, "close", dims.close);
     closeReady = true;
     // sweep (working-light) starts mattering at p=0.36, right after hold
     // begins (0.32) — load it fully alongside close, before ready, rather
@@ -556,7 +682,7 @@ export function initStory() {
     // budget as close) and needed almost immediately into the hold, not
     // traversed once at the far end of the timeline. A missing manifest
     // count (older asset set) makes this loop a no-op, same pattern as close.
-    for (let i = 0; i < dims.sweep; i++) await loadSeqFrame(base, "sweep", i, dims.sweep);
+    await loadSeqFramesConcurrent(base, "sweep", dims.sweep);
     ready = true;
     root.classList.add("is-ready");
     // P1 fix: cross-fade the canvas in over 300ms from whatever still was
@@ -583,9 +709,9 @@ export function initStory() {
     texAspect = dims.w / dims.h;
     // protect the continuity-critical ends of each sequence from LRU
     // eviction — see the FrameCache constructor comment for why
-    if (dims.arrive) cache.setProtected("arrive", [0, dims.arrive - 1]);
-    if (dims.close) cache.setProtected("close", [0, dims.close - 1]);
-    if (dims.open) cache.setProtected("open", [0, dims.open - 1]);
+    if (dims.arrive) cache.setProtected(segKey("arrive"), [0, dims.arrive - 1]);
+    if (dims.close) cache.setProtected(segKey("close"), [0, dims.close - 1]);
+    if (dims.open) cache.setProtected(segKey("open"), [0, dims.open - 1]);
     // Sweep gets ALL of its frames protected, not just the two endpoints:
     // unlike arrive/close/open (a single monotonic pass, where only the
     // current neighborhood and the two continuity endpoints ever matter),
@@ -602,7 +728,7 @@ export function initStory() {
     // keys are exempt from the eviction budget entirely (see
     // FrameCache._evictIfNeeded), so this is a fixed ~24-bitmap overhead on
     // top of the existing budget, not a change to it.
-    if (dims.sweep) cache.setProtected("sweep", Array.from({ length: dims.sweep }, (_, i) => i));
+    if (dims.sweep) cache.setProtected(segKey("sweep"), Array.from({ length: dims.sweep }, (_, i) => i));
   }
 
   // ---------------------------------------------------------------- render
@@ -632,11 +758,12 @@ export function initStory() {
       frame = d.arrive ? Math.round(t * (d.arrive - 1)) : 0;
     } else if (p < SEG.closeEnd) {
       seg = "close";
-      // raw linear scroll fraction, then the swing/seat remap (CLOSE_EXP) —
-      // NOT range()'s smoothstep, which would add a second, unwanted ease on
-      // top of the remap.
+      // raw linear scroll fraction, then the measured cumulative-distance
+      // remap (CLOSE_CUM/frameForCumulative — see the constant's comment
+      // above) — NOT range()'s smoothstep, which would add a second,
+      // unwanted ease on top of the remap.
       const t = linFrac(p, SEG.closeStart, SEG.closeEnd);
-      frame = d.close ? Math.round(Math.pow(t, CLOSE_EXP) * (d.close - 1)) : 0;
+      frame = d.close ? Math.round(frameForCumulative(CLOSE_CUM[useP ? "p" : "d"], t, d.close)) : 0;
       L = 0; // still dark (studio key at 55%; chamber light not yet up)
     } else if (p < SEG.holdEnd) {
       seg = "hold";
@@ -725,10 +852,39 @@ export function initStory() {
   // is necessary (background prefetch of the OTHER sequences would otherwise
   // race ahead and evict exactly what's on screen right now).
   const WINDOW_RADIUS = 4;
-  function nearestProtected(seg, frame, count) {
+  // `bareSeg` is the on-disk sequence name ("arrive"/"close"/"open"/
+  // "sweep"); internally namespaced by segKey() to the LIVE camera so a
+  // background switchCamera() load (into a separate cache instance) can
+  // never collide with what's actually on screen.
+  function nearestProtected(bareSeg, frame, count) {
     if (!count) return null;
-    cache.setWindow(seg, frame, WINDOW_RADIUS);
-    return cache.nearest(seg, frame, count);
+    const key = segKey(bareSeg);
+    cache.setWindow(key, frame, WINDOW_RADIUS);
+    // CS-02/CS-04 fix: bounded to WINDOW_RADIUS — see FrameCache.nearest's
+    // comment. Previously unbounded, so a cache miss just past a segment
+    // boundary could resolve to a frame from anywhere in the sequence
+    // (the "distant nearest-frame fallback" named in the contract).
+    return cache.nearest(key, frame, count, WINDOW_RADIUS);
+  }
+  function getCachedFrame(bareSeg, frame, count) {
+    const idx = nearestProtected(bareSeg, frame, count);
+    return idx != null ? cache.get(segKey(bareSeg), idx) : null;
+  }
+  // CS-02/CS-04/CS-05: resolves the bitmap to draw for a monotonic
+  // sequence (arrive/close/open). If the requested frame (or something
+  // within WINDOW_RADIUS of it) isn't resident, this NEVER falls back to a
+  // distant/arbitrary frame — it prioritizes a direct fetch of the exact
+  // missing frame and returns the last frame that WAS successfully drawn
+  // for this segment, so the caller redraws that (holding a coherent
+  // visual) instead of jumping or going blank. Returns null only when
+  // nothing has ever been drawn for this segment yet (first paint before
+  // any frame has loaded), in which case the caller's existing hold-only
+  // degrade applies.
+  function resolveFrame(bareSeg, frame, count) {
+    const bitmap = getCachedFrame(bareSeg, frame, count);
+    if (bitmap) { lastGood[bareSeg] = bitmap; return bitmap; }
+    priorityFetch(bareSeg, frame, count);
+    return lastGood[bareSeg];
   }
 
   let lastDrawKey = null;
@@ -779,7 +935,7 @@ export function initStory() {
         let sweepTex = null;
         if (sweepMixVal > 0 && dims.sweep) {
           const sIdx = nearestProtected("sweep", state.sweepFrame, dims.sweep);
-          if (sIdx != null) sweepTex = glCtx.getFrameTexture(cache.get("sweep", sIdx));
+          if (sIdx != null) sweepTex = glCtx.getFrameTexture(cache.get(segKey("sweep"), sIdx));
         }
         glCtx.drawHold({
           L: state.LOverride != null ? state.LOverride : state.L,
@@ -795,9 +951,8 @@ export function initStory() {
         });
       } else if (state.seg === "arrive" || state.seg === "dirty-dissolve") {
         const count = dims.arrive;
-        const idx = nearestProtected("arrive", state.frame, count);
-        if (idx != null) {
-          const bitmap = cache.get("arrive", idx);
+        const bitmap = resolveFrame("arrive", state.frame, count);
+        if (bitmap) {
           let uv = uvFor(bitmap);
           // Phone camera only: the wide "p" arrive frame, cover-fit into a
           // tall phone stage, leaves the machine small in the middle with a
@@ -836,9 +991,8 @@ export function initStory() {
         }
       } else if (state.seg === "close") {
         const count = dims.close;
-        const idx = nearestProtected("close", state.frame, count);
-        if (idx != null) {
-          const bitmap = cache.get("close", idx);
+        const bitmap = resolveFrame("close", state.frame, count);
+        if (bitmap) {
           const uv = uvFor(bitmap);
           glCtx.drawFrame(glCtx.getFrameTexture(bitmap), uv.scale, uv.offset, [0.059, 0.106, 0.09]);
         } else if (holdReady) {
@@ -848,9 +1002,8 @@ export function initStory() {
         }
       } else if (state.seg === "open" || state.seg === "clean-dissolve") {
         const count = dims.open;
-        const idx = nearestProtected("open", state.frame, count);
-        if (idx != null) {
-          const bitmap = cache.get("open", idx);
+        const bitmap = resolveFrame("open", state.frame, count);
+        if (bitmap) {
           const uv = uvFor(bitmap);
           glCtx.drawFrame(glCtx.getFrameTexture(bitmap), uv.scale, uv.offset, [0.059, 0.106, 0.09]);
         } else if (holdReady) {
@@ -872,9 +1025,8 @@ export function initStory() {
       ctx2d.drawImage(img, -offX, -offY, dispW, dispH);
       ctx2d.globalAlpha = 1;
     };
-    const drawSeqFrame = (seg, count) => {
-      const idx = nearestProtected(seg, state.frame, count);
-      if (idx != null) drawImg(cache.get(seg, idx));
+    const drawSeqFrame = (bareSeg, count) => {
+      drawImg(resolveFrame(bareSeg, state.frame, count));
     };
     ctx2d.clearRect(0, 0, w, h);
     if (state.seg === "hold" && holdReady) {
@@ -892,16 +1044,16 @@ export function initStory() {
         drawImg(img0); drawImg(img1, t);
       }
     } else if (state.seg === "arrive" || state.seg === "dirty-dissolve") {
-      const idx = nearestProtected("arrive", state.frame, dims.arrive);
-      if (idx != null) drawImg(cache.get("arrive", idx));
+      const bitmap = resolveFrame("arrive", state.frame, dims.arrive);
+      if (bitmap) drawImg(bitmap);
       else if (holdImgs2d["dirty-off"]) drawImg(holdImgs2d["dirty-off"]);
     } else if (state.seg === "close") {
-      const idx = nearestProtected("close", state.frame, dims.close);
-      if (idx != null) drawImg(cache.get("close", idx));
+      const bitmap = resolveFrame("close", state.frame, dims.close);
+      if (bitmap) drawImg(bitmap);
       else if (holdImgs2d["dirty-off"]) drawImg(holdImgs2d["dirty-off"]);
     } else {
-      const idx = nearestProtected("open", state.frame, dims.open);
-      if (idx != null) drawImg(cache.get("open", idx));
+      const bitmap = resolveFrame("open", state.frame, dims.open);
+      if (bitmap) drawImg(bitmap);
       else if (holdImgs2d["clean-off"]) drawImg(holdImgs2d["clean-off"]);
     }
   }
@@ -1236,15 +1388,20 @@ export function initStory() {
       debugCacheInfo: () => ({
         orderLength: cache.order.length,
         order: cache.order.slice(),
-        closeLoaded: (dims && dims.close ? Array.from({ length: dims.close }, (_, i) => cache.has("close", i)) : []),
-        openLoaded: (dims && dims.open ? Array.from({ length: dims.open }, (_, i) => cache.has("open", i)) : []),
-        arriveLoaded: (dims && dims.arrive ? Array.from({ length: dims.arrive }, (_, i) => cache.has("arrive", i)) : []),
+        nonProtectedLiveCount: cache._liveNonProtectedCount(),
+        budget: cache.max,
+        closeLoaded: (dims && dims.close ? Array.from({ length: dims.close }, (_, i) => cache.has(segKey("close"), i)) : []),
+        openLoaded: (dims && dims.open ? Array.from({ length: dims.open }, (_, i) => cache.has(segKey("open"), i)) : []),
+        arriveLoaded: (dims && dims.arrive ? Array.from({ length: dims.arrive }, (_, i) => cache.has(segKey("arrive"), i)) : []),
+        sweepLoaded: (dims && dims.sweep ? Array.from({ length: dims.sweep }, (_, i) => cache.has(segKey("sweep"), i)) : []),
         protectedKeys: Array.from(cache.protectedKeys),
+        switchingCamera,
       }),
       // test-only: draw whatever bitmap is actually stored in the cache for
-      // (seg,i) to a small canvas and return a pixel sample, to verify the
-      // cached bitmap really is the frame it claims to be.
-      debugCachedBitmapSample: (seg, i) => {
+      // (bareSeg,i) to a small canvas and return a pixel sample, to verify
+      // the cached bitmap really is the frame it claims to be.
+      debugCachedBitmapSample: (bareSeg, i) => {
+        const seg = segKey(bareSeg);
         const bm = cache.slots[seg] && cache.slots[seg][i];
         if (!bm) return null;
         const c = document.createElement("canvas");
@@ -1295,6 +1452,83 @@ export function initStory() {
     requestRender();
   }
 
+  // CS-05 fix: switchCamera() double-buffers an asset-set (camera) change.
+  // The previous implementation cleared the cache and set
+  // holdReady/closeReady/ready to false SYNCHRONOUSLY on every camera
+  // flip, which drove updateUI() into its "!ready" branch (canvas hidden,
+  // opacity 0) for the entire reload — a real, reproducible blank stage on
+  // resize/rotation across a breakpoint while pinned. Fix: load the new
+  // camera's hold layers + close + sweep (the same set the initial
+  // readiness gate waits on) into the SAME cache instance but under keys
+  // namespaced to the NEW camera (see segKey/evictPrefix), while the live
+  // useP/dims/texAspect/holdReady/ready stay pointed at the OLD camera the
+  // whole time — the canvas keeps rendering the old camera, uninterrupted,
+  // until the new one's essential assets are fully decoded. Only then does
+  // an atomic swap flip useP/dims/texAspect/hold textures together in one
+  // synchronous step, so no frame ever mixes old-camera geometry with
+  // new-camera textures (or vice versa). The old camera's frames are
+  // released (evictPrefix) only AFTER the new camera is live, bounding how
+  // long two camera's worth of frames are ever resident at once.
+  async function switchCamera(targetUseP) {
+    if (!manifest || switchingCamera) return;
+    switchingCamera = true;
+    try {
+      const targetDims = manifest[targetUseP ? "p" : "d"];
+      if (!targetDims) return;
+      const targetTexAspect = targetDims.w / targetDims.h;
+      const targetBase = `${seqBase}/${targetUseP ? "p" : "d"}`;
+      const targetPrefix = targetUseP ? "p_" : "d_";
+      const oldPrefix = useP ? "p_" : "d_";
+
+      const switchHold = await loadHoldLayers(targetBase);
+      if (!switchHold) return; // keep showing the old camera; never blank on a failed switch
+
+      if (targetDims.arrive) cache.setProtected(targetPrefix + "arrive", [0, targetDims.arrive - 1]);
+      if (targetDims.close) cache.setProtected(targetPrefix + "close", [0, targetDims.close - 1]);
+      if (targetDims.open) cache.setProtected(targetPrefix + "open", [0, targetDims.open - 1]);
+      if (targetDims.sweep) cache.setProtected(targetPrefix + "sweep", Array.from({ length: targetDims.sweep }, (_, i) => i));
+      await loadSeqFramesConcurrent(targetBase, "close", targetDims.close, cache, 5, targetPrefix + "close");
+      await loadSeqFramesConcurrent(targetBase, "sweep", targetDims.sweep, cache, 5, targetPrefix + "sweep");
+
+      // Atomic swap.
+      useP = targetUseP;
+      dims = targetDims;
+      texAspect = targetTexAspect;
+      currentBase = targetBase;
+      lastGood.arrive = null; lastGood.close = null; lastGood.open = null;
+      if (glCtx) {
+        glCtx.setHoldLayer("dirtyOff", switchHold["dirty-off"]);
+        glCtx.setHoldLayer("dirtyOn", switchHold["dirty-on"]);
+        glCtx.setHoldLayer("cleanOn", switchHold["clean-on"]);
+        glCtx.setHoldLayer("cleanOff", switchHold["clean-off"]);
+        glCtx.setHoldLayer("map", switchHold["map"]);
+        glCtx.setHoldLayer("window", switchHold["window"]);
+      } else {
+        holdImgs2d = switchHold;
+        holdImgs2d.baked = await loadBakedFallback(targetBase);
+      }
+      holdReady = true; closeReady = true; ready = true;
+      root.classList.add("is-ready");
+      measureHeaderHeight(); positionRail(); positionCaptions();
+      requestRender();
+
+      // Bounded memory: release the old camera's frames now that the new
+      // one is live, rather than holding both resident indefinitely.
+      cache.evictPrefix(oldPrefix);
+
+      if (targetDims.arrive) loadSeqProgressive(targetBase, "arrive", targetDims.arrive, cache, targetPrefix + "arrive");
+      if (targetDims.open) loadSeqProgressive(targetBase, "open", targetDims.open, cache, targetPrefix + "open");
+    } finally {
+      switchingCamera = false;
+      // A resize/rotation that happened WHILE this switch was in flight is
+      // dropped by the guard above (a second concurrent switch would race
+      // the same cache/dims mutation) — catch up now if the live camera no
+      // longer matches the current viewport.
+      const recheck = computeUseP();
+      if (recheck !== useP) switchCamera(recheck);
+    }
+  }
+
   let resizeTimer = null;
   window.addEventListener("resize", () => {
     clearTimeout(resizeTimer);
@@ -1303,16 +1537,14 @@ export function initStory() {
       isPhone = nowPhone; // layout breakpoint: always safe to update immediately
       const nowUseP = computeUseP();
       if (nowUseP !== useP) {
-        // Asset-set switch (orientation change, not necessarily a layout
-        // breakpoint change): reload the sequences under the new set. The
-        // current progress (p, driven by scroll) is untouched by this —
-        // only which frames/camera render it changes.
-        useP = nowUseP;
-        if (manifest) pickDims();
-        cache.clearAll();
-        loadingStarted = false;
-        holdReady = false; closeReady = false; ready = false;
-        startLoading();
+        if (!manifest) {
+          // Nothing has rendered yet — no "old camera" view to preserve,
+          // so just flip; the in-flight startLoading()/pickDims() will
+          // pick up this value once the manifest arrives.
+          useP = nowUseP;
+        } else {
+          switchCamera(nowUseP); // async, double-buffered — see switchCamera()
+        }
       }
       resizeCanvas();
       if (ScrollTrigger) ScrollTrigger.refresh();
@@ -1367,7 +1599,14 @@ export function initStory() {
     end: () => "+=" + Math.round(window.innerHeight * 4.0),
     pin,
     pinSpacing: true,
-    scrub: 0.35,
+    // CS-04 retune: 0.35s of scrub catch-up read as chunky/delayed,
+    // especially on close/open (contract-reported ~350ms lag). Retuned to
+    // 0.12s — inside the contract's suggested 0.08-0.15s short-scrub band —
+    // measured via Playwright-recorded slow/fast/reverse scroll passes
+    // (qa/final-2026-09-21/stream-a/recordings/) rather than physical
+    // trackpad/touch hardware, which this environment cannot exercise; see
+    // status/stream-a.md for that limitation.
+    scrub: 0.12,
     anticipatePin: 1,
     invalidateOnRefresh: true,
     onUpdate: (self) => { render(self.progress); ensureLoop(); },
