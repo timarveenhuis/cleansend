@@ -143,9 +143,16 @@ const TIMER_TOTAL_S = 4 * 60 + 52;
 // downsampled (64x64 grayscale) per-adjacent-frame RMS, cumulatively
 // summed and normalized to [0,1] — for each camera's real assets (see
 // qa/final-2026-09-21/stream-a/scripts/measure-frame-distance.mjs and its
-// logs/frame-distance-measurements.json; measured max deltas: d_close
-// 38.84, p_close 46.61, d_open 34.12, p_open 42.79 — consistent with the
-// contract's own reference numbers for the same audit method). Index i of
+// logs/frame-distance-measurements.json; measured max deltas (re-run
+// after Stream C's 930daf8 chamber clean-shoe promotion, which touched
+// open's pixel content only — geometry/count/timing/chamber rect
+// unchanged): d_close 38.84, p_close 46.61 (byte-identical to the
+// pre-930daf8 measurement, confirming close frames themselves are
+// untouched), d_open 32.65 (was 34.12), p_open 41.30 (was 42.79) —
+// consistent with the contract's own reference numbers for the same
+// audit method, and open's per-frame delta shape stays smoothly spread
+// across the sequence rather than bunched at one end — OPEN_EXP=1's
+// no-remap decision below still holds against the new frames). Index i of
 // each array is the fraction of the close swing's TOTAL visual motion that
 // has occurred by the time frame i is reached; frameForCumulative() inverts
 // it (t -> continuous frame index) so uniform scroll now produces uniform
