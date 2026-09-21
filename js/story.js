@@ -187,41 +187,37 @@ const OPEN_EXP = 1.0;
 // off the top and lifts the chamber, freeing the band the caption sits in.
 const FOCUS_DESKTOP = { x: 0.5, y: 0.60 };
 const FOCUS_PHONE = { x: 0.5, y: 0.52 };
-const MAX_RESIDENT_FRAMES = 20;
-// CS-03: explicit decoded-memory byte budget for the non-protected sliding
-// window, ON TOP OF the frame-count budget above — whichever is stricter
-// wins. A decoded 1536x1024 RGBA frame is ~6.29MB (1536*1024*4); 40MB is
-// room for roughly the 20-frame count budget's worth at that resolution
-// (the frame-count budget is normally the binding constraint at this
-// resolution — the byte budget exists as a hard backstop against a future
-// higher-resolution asset regenerate silently blowing the memory budget
-// even while staying under the frame-count cap).
-// Round 10: raised 40MB -> 64MB (~10 frames at 6.29MB each, up from ~6).
-// Root-caused a persistent hold that survived the priority-queue rewrite:
-// with all four sequences now loading somewhat concurrently (by design —
-// that's the whole point of the priority queue), a single shared 40MB
-// non-protected window was too small to hold even ONE segment's nearby
-// frames without them being evicted by the OTHER three segments' own
-// loads landing in the same shared budget -- confirmed directly
-// (qa/.../stream-a/lag/release4/): `close` frames near the actively-
-// needed one were resident only sparsely (endpoints + a couple of
-// leftovers), non-protected bytes sitting right at the old 40MB ceiling.
-// 64MB still leaves comfortable headroom under the 180MB MAX_TOTAL_BYTES
-// total ceiling (measured protected/fixed overhead ~100-105MB with sweep
-// capped, so 64MB non-protected keeps the worst case ~165-170MB, still
-// under 180MB).
-const MAX_RESIDENT_BYTES = 64 * 1024 * 1024;
+// Round 10 (two-tier cache): now a pure safety-net backstop for
+// FrameCache._evictIfNeeded — the PRIMARY eviction mechanism for
+// arrive/close/open decoded bitmaps is the look-ahead window
+// (maintainDecodeWindow/evictOutsideWindow), sized DECODE_WINDOW_BACK+
+// DECODE_WINDOW_FORWARD+1 = 19 frames max for one active segment.
+// Raised from the old priority-queue era's 20/64MB (sized for a shared
+// LRU budget across all four sequences at once) to comfortably exceed
+// the window's own natural size, so this backstop essentially never
+// fires in normal operation -- it only matters if something goes
+// genuinely wrong (e.g. windows briefly overlapping during a fast
+// segment transition).
+const MAX_RESIDENT_FRAMES = 45;
+// CS-03: explicit decoded-memory byte budget for the non-protected
+// sliding window, ON TOP OF the frame-count budget above — whichever is
+// stricter wins. Sized to comfortably hold the look-ahead window (19
+// frames) at the LARGER of the two desktop resolutions this engine
+// ships (full 1536x1024, ~6.29MB/frame -> ~120MB for 19 frames) with
+// margin, while still leaving real headroom under the 180MB
+// MAX_TOTAL_BYTES ceiling: measured fixed/protected overhead (sweep,
+// capped via sweepCapDims, + the 6 arrive/close/open endpoints) is only
+// ~35MB (qa/.../stream-a/scripts/memory-before-after.mjs), so 120MB
+// non-protected keeps the worst case ~155MB, comfortably under 180MB.
+const MAX_RESIDENT_BYTES = 120 * 1024 * 1024;
 // CS-03 hard ceiling: a genuine cap on TOTAL decoded bytes (protected +
 // non-protected), unlike MAX_RESIDENT_BYTES above which only ever bounded
-// the non-protected LRU slice. With sweep capped to <=1024x683 (see
+// the non-protected slice. With sweep capped to <=1024x683 (see
 // sweepCapDims — was the single largest fixed contributor at full
 // 1536x1024x24 frames, ~151MB), the fixed protected floor (24 sweep +
-// close/open/arrive endpoints) plus the 40MB LRU budget should stay
-// comfortably under this. Enforced in loadSeqFrame: a NON-PROTECTED
-// background load (arrive/open progressive prefetch — never a protected
-// or in-window frame, which are load-bearing for correctness) is skipped
-// once total resident bytes reach this ceiling, and retried on the next
-// progressive pass once eviction frees room.
+// arrive/close/open endpoints) plus the 120MB decode-window budget
+// should stay comfortably under this (measured worst case ~155MB).
+// Enforced in loadSeqFrame as a hard stop-everything backstop.
 const MAX_TOTAL_BYTES = 180 * 1024 * 1024;
 const bitmapBytes = (bm) => (bm && bm.width && bm.height ? bm.width * bm.height * 4 : 0);
 
@@ -377,6 +373,28 @@ class FrameCache {
     let n = 0;
     for (const key of this.order) if (!this._isProtected(key)) n++;
     return n;
+  }
+  // Round 10 (two-tier cache): evicts every resident, non-protected
+  // decoded bitmap for ONE namespaced segment (cacheSeg, e.g.
+  // "d1024_close") whose index falls outside [lo,hi] -- the primary
+  // eviction mechanism now for arrive/close/open (see
+  // maintainDecodeWindow), replacing the old LRU/priority-queue budget
+  // for those. Safe to evict freely: the underlying encoded bytes are
+  // never evicted (fetchEncodedBytes), so anything dropped here just
+  // re-decodes in ~8ms next time it's needed.
+  evictOutsideWindow(cacheSeg, lo, hi) {
+    const prefix = cacheSeg + ":";
+    for (let idx = this.order.length - 1; idx >= 0; idx--) {
+      const key = this.order[idx];
+      if (!key.startsWith(prefix)) continue;
+      if (this._isProtected(key)) continue;
+      const i = Number(key.slice(prefix.length));
+      if (i < lo || i > hi) {
+        this.order.splice(idx, 1);
+        const bitmap = this._slot(cacheSeg)[i];
+        if (bitmap) this._dropBitmap(cacheSeg, i, bitmap);
+      }
+    }
   }
   // Byte budget applies only to the non-protected count's own bytes (same
   // scope as the frame-count budget — protected frames are fixed overhead,
@@ -690,32 +708,20 @@ export function initStory() {
   let lastFrameTs = null;
   let rafId = null;
   let sectionVisible = false;
-  // Root-caused the deepest bug of this round: with this round's early-
-  // load kickoff (requestIdleCallback / setTimeout(0) firing right after
-  // DOM-parse, well before any scroll), this defaulting to true raced
-  // against the IntersectionObserver below that ever sets it false --
-  // IntersectionObserver callback timing isn't guaranteed to beat a 0ms
-  // setTimeout (confirmed on WebKit: it reliably didn't). Every
-  // priorityLoadAll() worker checks `if (farOffscreen) return;` as the
-  // FIRST thing in its loop, so on a fresh load the entire background
-  // priority queue could exit immediately, before ever picking a single
-  // item -- confirmed directly (qa/.../stream-a/lag/release7/dig-worker-
-  // trace.mjs): priorityLoadAll started with 108 pending items and
-  // logged zero of them ever picked. The ONLY thing that then loaded
-  // anything was the separate, unrelated "essential close neighborhood"
-  // bulk-await in startLoading() -- explaining release 7's live plateau
-  // (dig-live-plateau.mjs): loading looked "finished" within ~1.3s
-  // because it effectively never properly started, not because it
-  // legitimately completed. farOffscreen's actual intent ("stop
-  // background fetch once we've scrolled far away" -- see its use in
-  // loadSeqProgressive/priorityLoadAll below) only makes sense as a
-  // correction for a session that DID get close and then moved away; on
-  // a fresh load, before any intersection data exists at all, assuming
-  // "not far" is the correct default now that background loading is
-  // deliberately meant to start before the user is anywhere near the
-  // section. The IntersectionObserver (rootMargin 200%) still corrects
-  // this shortly after load if the section genuinely is far away, and
-  // priorityLoadAll's workers (retrying every 40ms) pick that up.
+  // History: this round's early-load kickoff (requestIdleCallback /
+  // setTimeout(0) firing right after DOM-parse) used to race against the
+  // IntersectionObserver that sets this false, and the old background
+  // priority-queue loader (priorityLoadAll, since replaced by the two-
+  // tier byte-prefetch/decode-window scheme below) checked this flag
+  // first thing in its worker loop -- with the default `true`, WebKit
+  // reliably lost that race and the ENTIRE background load silently
+  // never started (qa/.../stream-a/lag/release7/dig-worker-trace.mjs,
+  // dig-live-plateau.mjs). Defaulting to false fixed that. Not read by
+  // any loading logic any more (byte-prefetch and the decode window are
+  // cheap enough not to need an offscreen guard), but kept and still
+  // maintained by the IntersectionObserver below for the
+  // debugCacheInfo() diagnostic and as a hook if a future loader ever
+  // needs it again.
   let farOffscreen = false;
   let pinActive = false;
 
@@ -737,11 +743,40 @@ export function initStory() {
   // problem, root-caused and fixed this same round) without addressing
   // an actual rAF-blocking issue, so it's removed; decode is back on the
   // main thread, exactly as it was before round 10's Worker experiment.
+  // Round 10 (team lead's eviction+refetch fix): a two-tier cache.
+  // Verified directly against live release 7 (verify-eviction-refetch.mjs):
+  // some holds were frames never yet loaded (the farOffscreen bug, fixed
+  // separately), but others were genuinely-evicted frames paying a full
+  // network round trip again (198 sequence-frame requests logged for a
+  // single scroll pass across only 108 distinct frames -- real
+  // re-fetching). Fix: the ENCODED bytes (Blob) of every frame are kept
+  // resident for the rest of the session once fetched, ~17KB each
+  // (~2MB total desktop at d1024, ~3MB at 1536) -- trivial next to the
+  // 180MB ceiling -- so a frame is never fetched over the network twice.
+  // Only the DECODED bitmap (the expensive part: ~2.8MB at d1024, up to
+  // ~6.3MB at 1536) is bounded, via a look-ahead window (see
+  // maintainDecodeWindow) instead of the old LRU/priority-queue scheme.
+  // Re-decoding from an already-fetched Blob costs ~8ms and never
+  // touches the network, regardless of why the bitmap isn't resident.
+  // Keyed by the final (versioned) request URL, and de-duplicates
+  // concurrent requests for the same URL (two callers awaiting the same
+  // in-flight fetch, not two separate network requests).
+  const encodedBytesCache = new Map(); // url -> Promise<Blob>
+  function fetchEncodedBytes(url) {
+    let p = encodedBytesCache.get(url);
+    if (!p) {
+      p = fetch(url).then((res) => {
+        if (!res.ok) throw new Error(String(res.status));
+        return res.blob();
+      }).catch((e) => { encodedBytesCache.delete(url); throw e; });
+      encodedBytesCache.set(url, p);
+    }
+    return p;
+  }
+
   async function decodeOne(url) {
     try {
-      const res = await fetch(versioned(url));
-      if (!res.ok) throw new Error(String(res.status));
-      const blob = await res.blob();
+      const blob = await fetchEncodedBytes(versioned(url));
       return await createImageBitmap(blob);
     } catch (e) {
       return null;
@@ -755,9 +790,7 @@ export function initStory() {
   // Never upscales: a source already at or below the cap is used as-is.
   async function decodeOneCapped(url, maxW, maxH) {
     try {
-      const res = await fetch(versioned(url));
-      if (!res.ok) throw new Error(String(res.status));
-      const blob = await res.blob();
+      const blob = await fetchEncodedBytes(versioned(url));
       const full = await createImageBitmap(blob);
       if (full.width <= maxW && full.height <= maxH) return full;
       const scale = Math.min(maxW / full.width, maxH / full.height);
@@ -843,53 +876,13 @@ export function initStory() {
     // progressive/priority loader asked for them on its next pass, once
     // eviction of older non-protected frames frees room.
     const key = `${cacheSeg}:${i}`;
+    // CS-03 hard ceiling only, now a pure safety net: decoded-bitmap
+    // residency for arrive/close/open is governed by the look-ahead
+    // window (see maintainDecodeWindow/evictOutsideWindow below), which
+    // in normal operation keeps well under this on its own -- this just
+    // guards against a pathological case (many segments' windows
+    // overlapping at once, e.g. mid camera-switch) blowing the ceiling.
     if (!targetCache._isProtected(key) && targetCache.bytes >= MAX_TOTAL_BYTES) return;
-    // Root-caused WebKit's persistent post-fix hold (live 1440x900/
-    // 1280x720 natural pace, release 7: nonProtectedLiveCount plateaued
-    // at EXACTLY the 20-frame budget within ~1.3s of load and never
-    // changed again over the next 14s -- not "still loading", genuinely
-    // finished and stuck). Cause: priorityLoadAll's ONE-SHOT pass loads
-    // every segment, including ones the user hasn't reached yet (ranked
-    // behind the current segment, but still eventually processed) --
-    // each successful load's own _evictIfNeeded() is pure LRU (oldest
-    // TOUCHED first), which has no notion of priority. Since `open` is
-    // processed LAST in SEG_VIEW_ORDER's not-yet-reached fallback order,
-    // its frames are the FRESHEST by the time the whole pass finishes,
-    // so plain LRU keeps THEM and evicts `close`'s -- even though the
-    // user needs `close` first. Confirmed directly (qa/.../stream-a/
-    // lag/release7/dig-live-plateau.mjs): resident set stable at
-    // {arrive:8, close:2 (just its protected endpoints), open:22,
-    // sweep:24 (protected)} indefinitely. Fix: a background load for a
-    // segment the user has NOT reached yet (rank >= the "not current"
-    // fallback threshold) is skipped once the non-protected budget is
-    // already full, rather than displacing an already-resident, more
-    // relevant frame -- it only proceeds into genuinely free headroom.
-    // As the user's position advances, that segment's own rank drops
-    // below the threshold and it loads/evicts normally like any other
-    // current-segment frame. Trade-off: `open` (or any segment reached
-    // later) may not be pre-loaded ahead of time if arrive/close still
-    // hold the whole budget -- accepted deliberately: a bounded,
-    // resolveFrame-rescued cold-start cost at a segment boundary is far
-    // better than losing an already-visited segment's frames to one
-    // never-yet-reached.
-    // A per-segment fair-share cap (limiting how many frames any single
-    // not-yet-reached segment could hold, so `arrive` couldn't fill the
-    // whole budget before `close` got a turn) was tried and measured
-    // here alongside the guard below -- it helped `close`'s residency
-    // balance, but cost a real WebKit trackpad-cadence regression
-    // (0ms -> up to 371ms held), for a WORSE net result than the guard
-    // alone (measured: natural-pace total held dropped under the 600ms
-    // target with the guard alone, 516-563ms vs failing at 516-855ms
-    // with the added cap, and trackpad stayed fully clean at 0ms rather
-    // than regressing). Not kept -- see qa/.../stream-a/lag/release7/
-    // status write-up for the full A/B numbers.
-    if (!targetCache._isProtected(key)) {
-      const rank = priorityRank(bareSeg, i);
-      const NOT_YET_REACHED = 100000;
-      if (rank >= NOT_YET_REACHED && (targetCache._liveNonProtectedCount() >= targetCache.max || targetCache._nonProtectedBytes() >= targetCache.maxBytes)) {
-        return;
-      }
-    }
     const idxStr = String(i).padStart(3, "0");
     const url = `${base}/${bareSeg}/${idxStr}.webp`;
     const bm = bareSeg === "sweep"
@@ -911,207 +904,97 @@ export function initStory() {
     }
   }
 
-  // Live-site lag fix (stream-a/lag/): this was a strictly SEQUENTIAL
-  // single-stream loader (concurrency 1) despite three of these running
-  // "in parallel" as separate async calls (arrive/close-remainder/open) —
-  // each one individually could only ever have one decode in flight.
-  // Diagnosed directly against the live site under realistic network
-  // (20Mbps/40ms and 8Mbps/80ms CDP profiles, natural human scroll pace):
-  // 20.5% of ready samples showed the engine holding a stale frame
-  // (`resolveFrame`'s documented fallback), and 23 of 25 stalls had ZERO
-  // requests in flight at that instant — the loader simply hadn't reached
-  // that frame yet, a scheduling/throughput problem, not a bandwidth one
-  // (near-identical stall counts on both network profiles confirms this).
-  // Bounded-concurrency (default 6, tunable) fixes exactly that: same
-  // "every Nth frame first" priority order, decoded in parallel instead
-  // of one at a time, closing the gap between loader throughput and
-  // natural scroll speed. See stream-a/lag/logs/*-summary.json for the
-  // before numbers and the after re-measurement.
-  // Round 9 fix: the "every 4th frame first" priority order was designed
-  // to give a fast sparse overview of a segment the user hasn't reached
-  // yet — but for the segment the user is ACTIVELY, continuously
-  // scrolling through (confirmed to be `arrive`, loaded with top
-  // priority right after readiness), it actively fights a steadily-
-  // scrolling user, who needs frames in plain sequential order
-  // (0,1,2,3,...), not (0,4,8,...,1,2,3,5,6,7,...). Measured directly
-  // against the live site with page-side batched rAF sampling
-  // (qa/.../stream-a/lag/release4/): natural-pace scrolling produced a
-  // single CONTINUOUS 1.8s hold spanning arrive frames 7 through 34 (out
-  // of 36) — not brief gaps, a sustained "always a few frames behind"
-  // state through nearly the whole segment, exactly what a user would
-  // call "laggy". Switched to plain sequential order, and raised default
-  // concurrency 6 -> 8 (team lead's own originally-suggested 6-8 range)
-  // for additional headroom given how much the segment still needs to
-  // outrun natural scroll speed.
-  async function loadSeqProgressive(base, bareSeg, count, targetCache = cache, cacheSeg = segKey(bareSeg), concurrency = 8) {
-    if (!count) return;
-    const order = Array.from({ length: count }, (_, i) => i);
+  // Round 10 (team lead's two-tier-cache plan, replacing the priority-
+  // queue/eviction-guard machinery that used to live here across several
+  // earlier round-10 commits): now that ENCODED bytes are cheap and
+  // permanent (see fetchEncodedBytes above), background "loading" no
+  // longer needs any notion of priority, eviction protection, or a
+  // persistent worker pool fighting over a shared decoded-bitmap budget
+  // -- it just needs every frame's BYTES fetched at some point before
+  // they're needed, which is cheap (small files, no decode/GPU cost) and
+  // safe to do in plain, unprioritized order. What decodes and stays
+  // resident as a BITMAP is governed separately, per segment, by
+  // maintainDecodeWindow below, driven by where the user actually is.
+  //
+  // Simple bounded-concurrency byte-prefetch, no priority ordering
+  // needed: whichever frame's bytes land first, lands first -- nothing
+  // downstream depends on order, since maintainDecodeWindow will decode
+  // whatever's needed, from cache if bytes already arrived or via a
+  // fresh (deduplicated) fetch if not.
+  async function prefetchAllEncodedBytes(base, d) {
+    const items = [];
+    const addSeg = (bareSeg, count) => { for (let i = 0; i < count; i++) items.push(`${base}/${bareSeg}/${String(i).padStart(3, "0")}.webp`); };
+    addSeg("arrive", d.arrive || 0); addSeg("close", d.close || 0); addSeg("sweep", d.sweep || 0); addSeg("open", d.open || 0);
     let next = 0;
     async function worker() {
-      while (next < order.length) {
-        if (farOffscreen) return; // stop background fetch once we've scrolled far away
-        const i = order[next++];
-        await loadSeqFrame(base, bareSeg, i, count, targetCache, cacheSeg);
+      while (next < items.length) {
+        const url = items[next++];
+        try { await fetchEncodedBytes(versioned(url)); } catch (e) { /* a missed byte-prefetch just means loadSeqFrame fetches it fresh on demand later */ }
       }
     }
-    const n = Math.max(1, Math.min(concurrency, order.length));
+    const n = Math.max(1, Math.min(8, items.length || 1));
     await Promise.all(Array.from({ length: n }, () => worker()));
   }
 
-  // CS-03 fix: readiness previously awaited each frame sequentially
-  // (concurrency 1) via a plain `for` + `await` loop, serializing what are
-  // independent network+decode operations. Bounded-concurrency pool (default
-  // 5, tunable) — same total work, decoded in parallel, cutting readiness
-  // wall-clock roughly by the concurrency factor on any connection where
-  // requests aren't already saturating a single-connection bottleneck.
-  async function loadSeqFramesConcurrent(base, bareSeg, count, targetCache = cache, concurrency = 5, cacheSeg = segKey(bareSeg)) {
+  // Round 10 (two-tier cache): sweep is the one segment that stays
+  // fully DECODED and permanently protected for the whole session (see
+  // pickDims'/switchCamera's cache.setProtected calls) rather than
+  // going through the look-ahead window below -- it cycles through its
+  // whole 24-frame range repeatedly and unpredictably during the hold,
+  // so a window built for a single monotonic pass doesn't fit it.
+  // setProtected only marks indices EXEMPT from eviction, though -- it
+  // was previously priorityLoadAll's background pass (now removed) that
+  // actually decoded them. Needs its own explicit decode-all call,
+  // targeted specifically since it's the only segment the byte-prefetch
+  // above doesn't also decode.
+  async function decodeAllSweep(base, targetCache, count, cacheSeg = segKey("sweep")) {
     if (!count) return;
     let next = 0;
     async function worker() {
       while (next < count) {
         const i = next++;
-        await loadSeqFrame(base, bareSeg, i, count, targetCache, cacheSeg);
+        await loadSeqFrame(base, "sweep", i, count, targetCache, cacheSeg);
       }
     }
-    const n = Math.max(1, Math.min(concurrency, count));
+    const n = Math.max(1, Math.min(6, count));
     await Promise.all(Array.from({ length: n }, () => worker()));
   }
 
-  // Priority re-fetch: called when drawCanvas needs a frame that isn't
-  // resident and isn't within the bounded nearest-frame window (see
-  // nearestProtected/WINDOW_RADIUS below). Fire-and-forget — loadSeqFrame's
-  // own cache.has() check makes this idempotent against the regular
-  // progressive/readiness loaders also converging on the same frame.
-  function priorityFetch(bareSeg, i, count) {
+  // Round 10 (team lead's two-tier-cache plan, item 2): the decoded-
+  // bitmap budget for one segment is now a look-ahead WINDOW around the
+  // frame the user is actually at, not a shared LRU/priority-ranked
+  // budget across all four sequences -- decode ahead of the current
+  // frame (more than behind, since forward is the far more likely next
+  // position) and evict any decoded bitmap for THIS segment outside the
+  // window (protected endpoints excepted). Evicting here is now cheap
+  // and safe: the bytes stay cached (fetchEncodedBytes), so anything
+  // evicted just re-decodes in ~8ms next time it's needed, never a
+  // network round trip -- directly fixing the eviction-then-refetch
+  // pattern confirmed on live release 7 (qa/.../stream-a/lag/release7/
+  // verify-eviction-refetch.mjs: some holds were frames that had been
+  // resident earlier in the pass, evicted, and paid a full network
+  // round trip to come back).
+  const DECODE_WINDOW_BACK = 6;
+  const DECODE_WINDOW_FORWARD = 12;
+  let lastWindowKey = null;
+  async function maintainDecodeWindow(bareSeg, frame, count) {
     if (!currentBase || !count) return;
-    loadSeqFrame(currentBase, bareSeg, i, count);
-  }
-
-  // Round 10: demand-driven priority queue, replacing the fixed loader
-  // order (arrive->close->sweep->open / arrive+close concurrent). Team
-  // lead's read of the raw natural-pace numbers found the holds occur at
-  // fixed scroll points where a fixed loader order hasn't reached the
-  // segment the user is actually in — true regardless of which exact
-  // magnitude is right, and the 1280x720 reversal bug independently
-  // confirmed a fixed order can leave the WRONG segment unloaded when the
-  // user reverses. A priority queue keyed by distance from the CURRENTLY
-  // requested frame — recomputed on every pick, so it naturally re-
-  // prioritizes on every scroll update — generalizes and replaces both
-  // the ad hoc ordering and the round-9 patches.
-  //
-  // Priority: the frame within the ACTIVE segment closest to the current
-  // frame ranks best (0 = exact frame, 1 = one away, ...; "expanding
-  // forward then backward" falls out naturally from plain absolute
-  // distance). Frames in other segments rank behind all active-segment
-  // frames, ordered by their segment's position in the viewing timeline
-  // (arrive first, open last) as a reasonable fallback for a segment the
-  // user hasn't reached yet. In-flight fetches are never cancelled —
-  // `pending` items are simply removed once claimed by a worker and
-  // stay claimed until that fetch resolves; a persistent worker pool
-  // (bounded concurrency) just keeps picking whatever currently ranks
-  // best among what's left.
-  const SEG_VIEW_ORDER = { arrive: 0, close: 1, sweep: 2, open: 3 };
-  // Round 10 (revised plan, item 2): expanding forward first at equal
-  // distance -- a frame AHEAD of the current position (the direction a
-  // user is most likely to keep scrolling in, and the direction any
-  // fresh page load starts moving) wins over an equidistant frame
-  // behind it, while still never beating a genuinely closer frame in
-  // either direction. Encoded as rank = 2*distance for forward, +1 for
-  // backward, so 2d < 2d+1 < 2(d+1): closer always wins regardless of
-  // direction, direction only breaks a tie at the same distance.
-  function distRank(idx, center) {
-    const d = idx - center;
-    return d >= 0 ? d * 2 : -d * 2 + 1;
-  }
-  function priorityRank(bareSeg, idx) {
-    const cur = computeState(lastState.p);
-    if (cur.seg === bareSeg) return distRank(idx, cur.frame);
-    if (cur.seg === "hold" && bareSeg === "sweep") return distRank(idx, cur.sweepFrame);
-    return 100000 + SEG_VIEW_ORDER[bareSeg] * 1000;
-  }
-  // Loads every not-yet-resident frame across arrive/close/sweep/open for
-  // one camera (`camPrefix` = "d_"/"p_", `d` = that camera's manifest
-  // dims), via a persistent worker pool that always picks the
-  // currently-highest-priority remaining item. `keyFn(bareSeg)` lets the
-  // caller target either the live `cache` (segKey, default) or a
-  // switchCamera() shadow cache under its own prefix.
-  async function priorityLoadAll(base, targetCache, d, concurrency = 8, keyFn = segKey) {
-    const pending = [];
-    const addSeg = (bareSeg, count) => {
-      if (!count) return;
-      for (let i = 0; i < count; i++) if (!targetCache.has(keyFn(bareSeg), i)) pending.push({ bareSeg, i });
-    };
-    addSeg("arrive", d.arrive); addSeg("close", d.close); addSeg("sweep", d.sweep); addSeg("open", d.open);
-    const claimed = new Set();
+    const cacheSeg = segKey(bareSeg);
+    const lo = Math.max(0, frame - DECODE_WINDOW_BACK);
+    const hi = Math.min(count - 1, frame + DECODE_WINDOW_FORWARD);
+    cache.evictOutsideWindow(cacheSeg, lo, hi);
+    const toLoad = [];
+    for (let i = frame; i <= hi; i++) if (!cache.has(cacheSeg, i)) toLoad.push(i); // forward first
+    for (let i = frame - 1; i >= lo; i--) if (!cache.has(cacheSeg, i)) toLoad.push(i); // then backward
+    if (!toLoad.length) return;
+    let next = 0;
     async function worker() {
-      for (;;) {
-        if (farOffscreen) return;
-        let bestIdx = -1, bestRank = Infinity, anyPending = false;
-        for (let k = 0; k < pending.length; k++) {
-          const item = pending[k];
-          if (!item) continue;
-          anyPending = true;
-          const key = `${item.bareSeg}:${item.i}`;
-          if (claimed.has(key)) continue;
-          const rank = priorityRank(item.bareSeg, item.i);
-          if (rank < bestRank) { bestRank = rank; bestIdx = k; }
-        }
-        if (bestIdx === -1) {
-          // Root-caused a persistent hold that survived every earlier fix
-          // in this round (the byte-budget raise included): this used to
-          // `return` here unconditionally, permanently retiring the
-          // worker whenever everything currently unclaimed happened to
-          // be in flight on OTHER workers at that instant. Workers exit
-          // one by one as the queue drains, and since in-flight fetches
-          // are deliberately never cancelled, a later requeue (below,
-          // when a load completes but the frame still isn't resident --
-          // e.g. evicted by budget pressure) can land with ZERO workers
-          // left alive to ever notice it. Confirmed directly: a specific
-          // viewport's `close` segment stabilized on exactly the frames
-          // that happened to load before its last worker exited (cache
-          // endpoints + two incidental survivors), while the actively-
-          // needed frame sat re-queued and orphaned for the rest of the
-          // pass -- a ~1.1s hold once the user actually reached it,
-          // rescued only by resolveFrame()'s slow on-demand fetch.
-          // Fix: only exit once the queue is truly, structurally empty
-          // (no live entries at all); if items remain but are all
-          // momentarily claimed, wait briefly and re-poll instead of
-          // retiring, so a later requeue is always still being watched.
-          if (!anyPending) return;
-          await new Promise((resolve) => setTimeout(resolve, 40));
-          continue;
-        }
-        const item = pending[bestIdx];
-        const key = `${item.bareSeg}:${item.i}`;
-        claimed.add(key);
-        pending[bestIdx] = null;
-        await loadSeqFrame(base, item.bareSeg, item.i, d[item.bareSeg], targetCache, keyFn(item.bareSeg));
-        claimed.delete(key);
-        // Bug found while investigating a persistent hold that survived
-        // this priority queue's introduction (a viewport-specific case
-        // where `close` never got loaded before a reversal, even though
-        // it should have ranked first): loadSeqFrame() can return without
-        // the frame ever becoming resident (the MAX_TOTAL_BYTES ceiling
-        // check skips a non-essential decode once the budget's full) --
-        // but this loop unconditionally dropped it from `pending`
-        // (`pending[bestIdx] = null` above), permanently abandoning it
-        // for the rest of this pass. The ONLY thing that then ever
-        // rescued it was resolveFrame()'s slow, reactive, one-frame-at-a-
-        // time on-demand fetch once the user actually scrolled onto it --
-        // exactly matching the observed hold shape (several consecutive
-        // frames, each paying a full fetch+decode round trip in series).
-        // Re-queue instead of abandoning: if it's still not resident,
-        // push it back so a later pick (once eviction elsewhere frees
-        // ceiling headroom, or once it becomes the active/windowed frame
-        // and exempt from the ceiling) can retry it. A short backoff
-        // avoids the worker spinning tightly on a still-over-ceiling item.
-        if (!targetCache.has(keyFn(item.bareSeg), item.i)) {
-          pending.push(item);
-          await new Promise((resolve) => setTimeout(resolve, 60));
-        }
+      while (next < toLoad.length) {
+        const i = toLoad[next++];
+        await loadSeqFrame(currentBase, bareSeg, i, count);
       }
     }
-    const n = Math.max(1, Math.min(concurrency, pending.length || 1));
+    const n = Math.max(1, Math.min(6, toLoad.length));
     await Promise.all(Array.from({ length: n }, () => worker()));
   }
 
@@ -1132,20 +1015,19 @@ export function initStory() {
     positionCaptions();
     const base = `${seqBase}/${cameraKey(useP, useLite)}`;
     currentBase = base;
-    // Round 10: start the FULL priority-queue load (all four sequences)
-    // as early as possible — `dims`/`base` are known as soon as
+    // Round 10 (two-tier cache): start prefetching every frame's ENCODED
+    // bytes as early as possible — `dims`/`base` are known as soon as
     // pickDims() above returns, well before hold layers or the close-
-    // essential readiness fetch even start. This is round 9's "kick
-    // arrive off early" generalized to every segment, via the priority
-    // queue defined above: whichever frame is actually closest to the
-    // current scroll position (arrive/frame 0 on a fresh load) naturally
-    // wins priority regardless of segment, and re-prioritizes itself as
-    // `lastState.p` changes — no separate per-segment kickoff logic
-    // needed. `.then()` marks closeReady once the whole pass settles
-    // (closeReady isn't read elsewhere, kept for parity with prior
-    // rounds' semantics).
-    const backgroundLoadPromise = priorityLoadAll(base, cache, dims, 8);
+    // essential readiness fetch even start. No priority ordering needed
+    // any more (see prefetchAllEncodedBytes above) since byte-fetching
+    // doesn't compete with anything for a decode/GPU budget; whatever
+    // the user actually scrolls to decodes from cache almost instantly
+    // regardless of prefetch order. `.then()` marks closeReady once the
+    // whole pass settles (closeReady isn't read elsewhere, kept for
+    // parity with prior rounds' semantics).
+    const backgroundLoadPromise = prefetchAllEncodedBytes(base, dims);
     backgroundLoadPromise.then(() => { closeReady = true; });
+    decodeAllSweep(base, cache, dims.sweep);
 
     // P1 fix: fetch the small baked-050 standby BEFORE the heavy hold
     // layers/close sequence (~1.6 MB+) so scrolling into the locked/
@@ -1445,22 +1327,32 @@ export function initStory() {
   // Round 10: this docstring's "prioritizes a direct fetch of the exact
   // missing frame" was NOT actually true whenever a WINDOW_RADIUS-nearby
   // substitute existed -- the early `if (bitmap) return bitmap` below
-  // returned the substitute WITHOUT ever calling priorityFetch for the
-  // real requested frame, since `bitmap` (from getCachedFrame's bounded-
-  // nearest lookup) is truthy as soon as ANY frame within radius 6 is
-  // resident. Root-caused a persistent, exactly-reproducible ~1.1s hold
-  // this way: a segment's permanently-protected endpoint (always
-  // resident) sits within radius 6 of several frames, so the engine
-  // silently substituted it and NEVER asked for the real one -- and
-  // since the one-shot background priority queue (priorityLoadAll) had
-  // already finished its pass by the time the user reached that
-  // position, nothing else was ever going to fetch it either. Fix:
-  // always fetch the EXACT frame on demand when it isn't resident,
-  // independent of whether a nearby substitute was found for display --
-  // "what to show right now" and "what to make resident" are separate
-  // concerns; conflating them is what caused this.
+  // returned the substitute WITHOUT ever fetching the real requested
+  // frame, since `bitmap` (from getCachedFrame's bounded-nearest lookup)
+  // is truthy as soon as ANY frame within radius 6 is resident.
+  // Root-caused a persistent, exactly-reproducible ~1.1s hold this way:
+  // a segment's permanently-protected endpoint (always resident) sits
+  // within radius 6 of several frames, so the engine silently
+  // substituted it and NEVER asked for the real one. Fix: always ensure
+  // the exact frame's window is being maintained (see
+  // maintainDecodeWindow, two-tier-cache era) independent of whether a
+  // nearby substitute was found for display -- "what to show right now"
+  // and "what to make resident" are separate concerns; conflating them
+  // is what caused this.
+  //
+  // Round 10 (two-tier cache): maintainDecodeWindow replaces the old
+  // one-shot priorityFetch -- called once per DISTINCT (seg,frame) the
+  // render path asks for (deduped via lastWindowKey, not every rAF
+  // tick), it both ensures the exact frame decodes (forward-first
+  // within its own window-fill order) and evicts whatever fell outside
+  // the window, so a segment's residency always tracks the CURRENT
+  // position rather than aging out via generic LRU.
   function resolveFrame(bareSeg, frame, count) {
-    if (!cache.has(segKey(bareSeg), frame)) priorityFetch(bareSeg, frame, count);
+    const winKey = `${bareSeg}:${frame}`;
+    if (winKey !== lastWindowKey) {
+      lastWindowKey = winKey;
+      maintainDecodeWindow(bareSeg, frame, count);
+    }
     const bitmap = getCachedFrame(bareSeg, frame, count);
     if (bitmap) { lastGood[bareSeg] = bitmap; return bitmap; }
     return lastGood[bareSeg];
@@ -2237,9 +2129,11 @@ export function initStory() {
       // one is live, rather than holding both resident indefinitely.
       cache.evictPrefix(oldPrefix);
 
-      // Round 10: same demand-driven priority queue as startLoading(),
-      // targeted at this new camera's namespaced cache keys.
-      priorityLoadAll(targetBase, cache, targetDims, 8, (bareSeg) => targetPrefix + bareSeg).then(() => { closeReady = true; });
+      // Round 10 (two-tier cache): same byte-prefetch as startLoading() —
+      // no camera-prefix parameter needed since the encoded-bytes cache
+      // is keyed purely by URL, which already encodes the camera path.
+      prefetchAllEncodedBytes(targetBase, targetDims).then(() => { closeReady = true; });
+      decodeAllSweep(targetBase, cache, targetDims.sweep, targetPrefix + "sweep");
     } finally {
       switchingCamera = false;
       // A resize/rotation that happened WHILE this switch was in flight is
