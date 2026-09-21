@@ -690,7 +690,33 @@ export function initStory() {
   let lastFrameTs = null;
   let rafId = null;
   let sectionVisible = false;
-  let farOffscreen = true;
+  // Root-caused the deepest bug of this round: with this round's early-
+  // load kickoff (requestIdleCallback / setTimeout(0) firing right after
+  // DOM-parse, well before any scroll), this defaulting to true raced
+  // against the IntersectionObserver below that ever sets it false --
+  // IntersectionObserver callback timing isn't guaranteed to beat a 0ms
+  // setTimeout (confirmed on WebKit: it reliably didn't). Every
+  // priorityLoadAll() worker checks `if (farOffscreen) return;` as the
+  // FIRST thing in its loop, so on a fresh load the entire background
+  // priority queue could exit immediately, before ever picking a single
+  // item -- confirmed directly (qa/.../stream-a/lag/release7/dig-worker-
+  // trace.mjs): priorityLoadAll started with 108 pending items and
+  // logged zero of them ever picked. The ONLY thing that then loaded
+  // anything was the separate, unrelated "essential close neighborhood"
+  // bulk-await in startLoading() -- explaining release 7's live plateau
+  // (dig-live-plateau.mjs): loading looked "finished" within ~1.3s
+  // because it effectively never properly started, not because it
+  // legitimately completed. farOffscreen's actual intent ("stop
+  // background fetch once we've scrolled far away" -- see its use in
+  // loadSeqProgressive/priorityLoadAll below) only makes sense as a
+  // correction for a session that DID get close and then moved away; on
+  // a fresh load, before any intersection data exists at all, assuming
+  // "not far" is the correct default now that background loading is
+  // deliberately meant to start before the user is anywhere near the
+  // section. The IntersectionObserver (rootMargin 200%) still corrects
+  // this shortly after load if the section genuinely is far away, and
+  // priorityLoadAll's workers (retrying every 40ms) pick that up.
+  let farOffscreen = false;
   let pinActive = false;
 
   cache.onEvict = (bitmap) => { if (glCtx) glCtx.dropFrameTexture(bitmap); };
@@ -818,6 +844,52 @@ export function initStory() {
     // eviction of older non-protected frames frees room.
     const key = `${cacheSeg}:${i}`;
     if (!targetCache._isProtected(key) && targetCache.bytes >= MAX_TOTAL_BYTES) return;
+    // Root-caused WebKit's persistent post-fix hold (live 1440x900/
+    // 1280x720 natural pace, release 7: nonProtectedLiveCount plateaued
+    // at EXACTLY the 20-frame budget within ~1.3s of load and never
+    // changed again over the next 14s -- not "still loading", genuinely
+    // finished and stuck). Cause: priorityLoadAll's ONE-SHOT pass loads
+    // every segment, including ones the user hasn't reached yet (ranked
+    // behind the current segment, but still eventually processed) --
+    // each successful load's own _evictIfNeeded() is pure LRU (oldest
+    // TOUCHED first), which has no notion of priority. Since `open` is
+    // processed LAST in SEG_VIEW_ORDER's not-yet-reached fallback order,
+    // its frames are the FRESHEST by the time the whole pass finishes,
+    // so plain LRU keeps THEM and evicts `close`'s -- even though the
+    // user needs `close` first. Confirmed directly (qa/.../stream-a/
+    // lag/release7/dig-live-plateau.mjs): resident set stable at
+    // {arrive:8, close:2 (just its protected endpoints), open:22,
+    // sweep:24 (protected)} indefinitely. Fix: a background load for a
+    // segment the user has NOT reached yet (rank >= the "not current"
+    // fallback threshold) is skipped once the non-protected budget is
+    // already full, rather than displacing an already-resident, more
+    // relevant frame -- it only proceeds into genuinely free headroom.
+    // As the user's position advances, that segment's own rank drops
+    // below the threshold and it loads/evicts normally like any other
+    // current-segment frame. Trade-off: `open` (or any segment reached
+    // later) may not be pre-loaded ahead of time if arrive/close still
+    // hold the whole budget -- accepted deliberately: a bounded,
+    // resolveFrame-rescued cold-start cost at a segment boundary is far
+    // better than losing an already-visited segment's frames to one
+    // never-yet-reached.
+    // A per-segment fair-share cap (limiting how many frames any single
+    // not-yet-reached segment could hold, so `arrive` couldn't fill the
+    // whole budget before `close` got a turn) was tried and measured
+    // here alongside the guard below -- it helped `close`'s residency
+    // balance, but cost a real WebKit trackpad-cadence regression
+    // (0ms -> up to 371ms held), for a WORSE net result than the guard
+    // alone (measured: natural-pace total held dropped under the 600ms
+    // target with the guard alone, 516-563ms vs failing at 516-855ms
+    // with the added cap, and trackpad stayed fully clean at 0ms rather
+    // than regressing). Not kept -- see qa/.../stream-a/lag/release7/
+    // status write-up for the full A/B numbers.
+    if (!targetCache._isProtected(key)) {
+      const rank = priorityRank(bareSeg, i);
+      const NOT_YET_REACHED = 100000;
+      if (rank >= NOT_YET_REACHED && (targetCache._liveNonProtectedCount() >= targetCache.max || targetCache._nonProtectedBytes() >= targetCache.maxBytes)) {
+        return;
+      }
+    }
     const idxStr = String(i).padStart(3, "0");
     const url = `${base}/${bareSeg}/${idxStr}.webp`;
     const bm = bareSeg === "sweep"
