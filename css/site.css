@@ -718,6 +718,59 @@ html:not(.js) .story-stage, html:not(.js) .story-ui { display: none; }
   .final-visual { width: 100%; align-self: auto; }
 }
 
+/* CS-08: at 1024-1194px the single-column ≤1194 layout above sizes
+   .hero-visual purely from content WIDTH (width:100%, aspect-ratio-driven
+   height) — at ~1146px of available content width that produces a ~764px
+   tall image by itself, pushing the €2/no-app facts and the CTA below the
+   fold, while at 1195px the two-column desktop layout shows headline,
+   image, €2/no-app and CTA together in one screen. That two-pixel jump is
+   the defect the contract calls out. Fix: in this band, cap the image by
+   viewport HEIGHT instead of by content width (so it responds to both
+   axes, not just width), and tighten vertical rhythm around it, so
+   identity + a useful machine view + €2/no-app + the CTA (the "next
+   action") all fit in a typical first viewport without shrinking the type
+   or making the layout feel cramped elsewhere. A shorter secondary query
+   compacts further for genuinely short windows (e.g. 1193x800, 1280x720). */
+@media (min-width: 1024px) and (max-width: 1194px) {
+  /* the base .h1 clamp (2.5rem-4.3rem) is sized for the wide desktop
+     column; at this band's ~640px max-width it makes each of the two
+     headline "beat" lines wrap again into 3-4 visual lines, which alone
+     can eat 250px+ of height. Cap it so the headline reliably renders as
+     its intended two lines and stops dominating the vertical budget. */
+  .hero-head h1.h1 { font-size: clamp(1.9rem, 1rem + 2.1vw, 2.6rem); }
+  .hero-grid { padding-block: var(--space-6) var(--space-5); }
+  .hero-head .eyebrow { margin-bottom: var(--space-3); }
+  .hero-visual {
+    width: auto; max-width: 100%; height: min(34vh, 380px); aspect-ratio: 2560 / 1707;
+    margin: var(--space-3) auto; min-height: 0;
+  }
+  .hero-sub { margin-top: var(--space-3); }
+  .hero-actions { margin-top: var(--space-4); }
+  .hero-facts { margin-top: var(--space-4); padding-top: var(--space-4); }
+  .hero-trust { margin-top: var(--space-2); }
+}
+@media (min-width: 1024px) and (max-width: 1194px) and (max-height: 1050px) {
+  .hero-grid { padding-block: var(--space-5) var(--space-4); }
+  .hero-visual { height: min(27vh, 300px); margin-block: var(--space-2); }
+  .hero-sub { margin-top: var(--space-2); }
+  .hero-actions { margin-top: var(--space-3); }
+  .hero-facts { margin-top: var(--space-3); padding-top: var(--space-3); }
+  /* the no-heat/water/chemicals trust line is useful but not required in
+     the first viewport by the contract (identity, machine, €2/no-app and
+     the CTA are); dropping it first buys back ~30px before anything else
+     has to shrink further. */
+  .hero-trust { display: none; }
+}
+@media (min-width: 1024px) and (max-width: 1194px) and (max-height: 760px) {
+  .hero-visual { height: min(20vh, 220px); }
+  .hero-head h1.h1 { font-size: clamp(1.7rem, 1rem + 1.6vw, 2.2rem); }
+}
+@media (min-width: 1024px) and (max-width: 1194px) and (max-height: 660px) {
+  .hero-grid { padding-block: var(--space-4) var(--space-3); }
+  .hero-visual { height: min(16vh, 170px); }
+  .hero-head .eyebrow { margin-bottom: var(--space-2); }
+}
+
 /* Round 3 (revised), item 1: container-query failsafe for the outcomes and
    safety sections, ALONGSIDE (not instead of) the @media rules above.
    Root-caused the persisting 200%-zoom overlap with real DevTools-style
