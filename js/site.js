@@ -3,7 +3,7 @@
 // CS-15 cache-busting: keep this token in sync with index.html's
 // data-build attribute and the ?v= token on every other static reference
 // (see README.md "Cache-busting token" for how to bump it before a release).
-import { initStory } from "./story.js?v=20260921c";
+import { initStory } from "./story.js?v=20260921d";
 const gsap = window.gsap;
 const ScrollTrigger = window.ScrollTrigger;
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
