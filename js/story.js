@@ -378,15 +378,55 @@ export function initStory() {
       if (!target) return;
       const header = document.querySelector(".site-header");
       const headerH = header ? header.getBoundingClientRect().height : 0;
-      const top = target.getBoundingClientRect().top + window.scrollY - headerH;
-      window.scrollTo({ top, behavior: reduceMotion ? "auto" : "smooth" });
+      // 16px margin below the header, matching the "at least 16px from
+      // viewport edges" rule applied to the story's own captions/rail.
+      const top = target.getBoundingClientRect().top + window.scrollY - headerH - 16;
       const heading = document.getElementById("outcomes-h");
-      if (heading) {
+      const focusHeading = () => {
+        if (!heading) return;
         const hadTabindex = heading.hasAttribute("tabindex");
         if (!hadTabindex) heading.setAttribute("tabindex", "-1");
-        heading.focus();
+        // preventScroll: focusing during/just after an in-flight smooth
+        // scroll otherwise lets the browser's own focus-scroll-into-view
+        // behavior fight the scroll already under way.
+        heading.focus({ preventScroll: true });
         if (!hadTabindex) heading.addEventListener("blur", () => heading.removeAttribute("tabindex"), { once: true });
+      };
+      if (reduceMotion) {
+        // Immediate correct jump: no animation to wait out, so focus can
+        // follow the scroll on the very next frame.
+        window.scrollTo({ top, behavior: "auto" });
+        focusHeading();
+        return;
       }
+      // Bug fix (CS-07): the previous code called heading.focus()
+      // synchronously right after starting the smooth scroll, so the
+      // browser's default focus-scroll-into-view algorithm fired mid-
+      // animation and fought the in-flight scrollTo — confirmed to settle
+      // short, leaving ~279px of outgoing story still above #outcomes at
+      // 390x844 instead of the heading landing below the header. Move
+      // focus only once the scroll has actually settled.
+      window.scrollTo({ top, behavior: "smooth" });
+      let settled = false;
+      const settle = () => { if (settled) return; settled = true; focusHeading(); };
+      if ("onscrollend" in window) {
+        window.addEventListener("scrollend", settle, { once: true });
+      } else {
+        // Safari/WebKit fallback (no scrollend event as of this writing):
+        // poll scrollY until it stops moving for a few consecutive frames.
+        let last = window.scrollY, stableFrames = 0;
+        const poll = () => {
+          if (settled) return;
+          if (Math.abs(window.scrollY - last) < 1) {
+            stableFrames++;
+            if (stableFrames >= 3) return settle();
+          } else stableFrames = 0;
+          last = window.scrollY;
+          requestAnimationFrame(poll);
+        };
+        requestAnimationFrame(poll);
+      }
+      setTimeout(settle, 900); // hard cap in case neither path fires
     });
   }
 
@@ -1076,7 +1116,15 @@ export function initStory() {
     stage.style.setProperty("--tone-op", tone.toFixed(3));
 
     captions.forEach((el) => {
-      const a = Number(el.dataset.from), b = Number(el.dataset.to);
+      const a = Number(el.dataset.from);
+      // Bug fix (CS-07): the last caption's data-to is 1.01, past the
+      // scroll's actual max p of 1 — its fade-out window (b-w..b) then
+      // never finishes inside the reachable range, so it stalls partway
+      // (confirmed: opacity 0.5 at p=1, a permanent low-opacity ghost
+      // rather than a clean removal). Clamp the fade-out target to 1 so
+      // every caption, including one authored with to > 1, is fully gone
+      // by the time scrolling actually ends.
+      const b = Math.min(Number(el.dataset.to), 1);
       const w = 0.02;
       const o = a === 0 ? 1 - range(state.p, b - w, b) : range(state.p, a, a + w) * (1 - range(state.p, b - w, b));
       el.style.opacity = o.toFixed(3);
@@ -1301,6 +1349,12 @@ export function initStory() {
       captionsBox.classList.remove("se-captions--tight");
       captionsBox.removeAttribute("data-pos");
       captionsBox.style.maxHeight = "";
+      // Clear the desktop branch's inline height too: an inline style beats
+      // any external stylesheet rule regardless of specificity, so a stale
+      // px height set while desktop-sized would otherwise survive a resize
+      // down into phone/short-landscape and override that layout's own
+      // var(--se-caption-h)-driven height.
+      captionsBox.style.height = "";
       // A sane minimum band (96px) rather than trying to read the CSS
       // default back out of getComputedStyle — a custom property's computed
       // value is returned as its literal token string (e.g. "25vh"), not a
@@ -1328,13 +1382,37 @@ export function initStory() {
     const headerBottom = header ? header.getBoundingClientRect().bottom : 0;
     const safeTop = headerBottom + 16, safeBottom = window.innerHeight - 16;
     const availableH = Math.max(80, safeBottom - safeTop);
-    const tallest = measureTallestCaption();
-    captionsBox.style.maxHeight = `${Math.min(tallest, availableH)}px`;
-
+    // Bug fix (CS-06): every .se-caption is position:absolute, so none of
+    // them contribute to .se-captions's in-flow content height — max-height
+    // alone caps a height that's already 0, it never GIVES the box a used
+    // height, so overflow:hidden clips the active caption entirely (measured
+    // at 1440x900: box 380x0px against a real ~380x116px active child).
+    // Setting height (not just max-height) is what actually reserves the
+    // space the absolutely-positioned active caption paints into.
     captionsBox.classList.remove("se-captions--tight");
     captionsBox.removeAttribute("data-pos");
+    const applyHeight = () => {
+      const tallest = measureTallestCaption();
+      const boxH = Math.min(tallest, availableH);
+      captionsBox.style.height = `${boxH}px`;
+      captionsBox.style.maxHeight = `${boxH}px`;
+      return tallest;
+    };
+    let tallest = applyHeight();
+    // A short viewport (confirmed at 1193x800) can leave availableH smaller
+    // than the default-size caption's real content height even with no
+    // chamber overlap at all: capping height to availableH then still
+    // clips the last ~4-5px of the caption. Escalate to the smaller font
+    // step here too, the same way chamber overlap does below, whenever the
+    // content itself doesn't fit the safe box — not only when it collides
+    // with the chamber.
+    if (tallest > availableH) {
+      captionsBox.classList.add("se-captions--tight");
+      tallest = applyHeight();
+    }
     if (!anyIntersects()) return;
     captionsBox.classList.add("se-captions--tight");
+    applyHeight();
     if (!anyIntersects()) return;
     captionsBox.setAttribute("data-pos", "top");
   }
