@@ -755,19 +755,54 @@ export function initStory() {
       : await decodeOne(url);
     if (bm) {
       targetCache.set(cacheSeg, i, bm);
+      // Live-site lag fix: upload to the GPU here, at decode time, instead
+      // of leaving it for the first draw to pay for lazily (getFrameTexture
+      // is idempotent — a bitmap already uploaded here is a cache hit when
+      // drawCanvas calls it again). Moves the texImage2D cost off the
+      // critical render-path frame and into the background loading flow,
+      // where a few extra ms doesn't cost a dropped visual frame. Measured
+      // upload cost was already small on average (0.65ms) but spiked to
+      // 5ms+ on individual frames — this removes that spike from whatever
+      // rAF happens to be the first one to draw a freshly-decoded frame.
+      if (glCtx) glCtx.getFrameTexture(bm);
       if (targetCache === cache) requestRender();
     }
   }
 
-  async function loadSeqProgressive(base, bareSeg, count, targetCache = cache, cacheSeg = segKey(bareSeg)) {
-    // every 4th frame first, then fill the rest
+  // Live-site lag fix (stream-a/lag/): this was a strictly SEQUENTIAL
+  // single-stream loader (concurrency 1) despite three of these running
+  // "in parallel" as separate async calls (arrive/close-remainder/open) —
+  // each one individually could only ever have one decode in flight.
+  // Diagnosed directly against the live site under realistic network
+  // (20Mbps/40ms and 8Mbps/80ms CDP profiles, natural human scroll pace):
+  // 20.5% of ready samples showed the engine holding a stale frame
+  // (`resolveFrame`'s documented fallback), and 23 of 25 stalls had ZERO
+  // requests in flight at that instant — the loader simply hadn't reached
+  // that frame yet, a scheduling/throughput problem, not a bandwidth one
+  // (near-identical stall counts on both network profiles confirms this).
+  // Bounded-concurrency (default 6, tunable) fixes exactly that: same
+  // "every Nth frame first" priority order, decoded in parallel instead
+  // of one at a time, closing the gap between loader throughput and
+  // natural scroll speed. See stream-a/lag/logs/*-summary.json for the
+  // before numbers and the after re-measurement.
+  async function loadSeqProgressive(base, bareSeg, count, targetCache = cache, cacheSeg = segKey(bareSeg), concurrency = 6) {
+    if (!count) return;
+    // every 4th frame first (covers the whole range quickly at low
+    // resolution), then fill the rest — same priority order as before,
+    // now drained by a worker pool instead of one item at a time.
     const order = [];
     for (let i = 0; i < count; i += 4) order.push(i);
     for (let i = 0; i < count; i++) if (i % 4 !== 0) order.push(i);
-    for (const i of order) {
-      if (farOffscreen) return; // stop background fetch once we've scrolled far away
-      await loadSeqFrame(base, bareSeg, i, count, targetCache, cacheSeg);
+    let next = 0;
+    async function worker() {
+      while (next < order.length) {
+        if (farOffscreen) return; // stop background fetch once we've scrolled far away
+        const i = order[next++];
+        await loadSeqFrame(base, bareSeg, i, count, targetCache, cacheSeg);
+      }
     }
+    const n = Math.max(1, Math.min(concurrency, order.length));
+    await Promise.all(Array.from({ length: n }, () => worker()));
   }
 
   // CS-03 fix: readiness previously awaited each frame sequentially
@@ -910,14 +945,30 @@ export function initStory() {
     }
     requestRender();
 
-    // background: the rest of close, all of sweep, arrive and open —
-    // concurrent (not sequential/blocking each other) and non-blocking of
-    // `ready`. loadSeqFrame's own cache.has() check makes re-requesting the
+    // Live-site lag fix: these four background loaders previously all
+    // started at once, each internally concurrent (5-6 way). Diagnosed
+    // directly against the live site (stream-a/lag/): even with each
+    // loader's own concurrency raised, real arrive-frame throughput was
+    // far below what 6-way parallelism should achieve (12 of 36 frames
+    // resident 1.5s after readiness, on a 20Mbps/40ms profile) — traced to
+    // the four loaders (up to 6+6+5+6=23 desired simultaneous requests)
+    // contending for the SAME per-origin connection budget (Chromium caps
+    // HTTP/1.1 at 6 connections/origin; even under HTTP/2, four
+    // simultaneous decode streams compete for the same main-thread
+    // decode/upload time). `arrive` is needed almost immediately (it's the
+    // very next segment after the dirty-dissolve), `close` next, `sweep`
+    // only once `hold` is reached, `open` last — so run them SEQUENTIALLY
+    // in that viewing-order priority instead of all at once: each gets the
+    // full connection/decode budget for its own turn, sooner content loads
+    // sooner, without ever blocking `ready` above (this IIFE is fire-and-
+    // forget). loadSeqFrame's own cache.has() check makes re-requesting the
     // already-preloaded close neighborhood above a harmless no-op.
-    if (dims.close) loadSeqProgressive(base, "close", dims.close).then(() => { closeReady = true; });
-    if (dims.sweep) loadSeqFramesConcurrent(base, "sweep", dims.sweep);
-    if (dims.arrive) loadSeqProgressive(base, "arrive", dims.arrive);
-    if (dims.open) loadSeqProgressive(base, "open", dims.open);
+    (async () => {
+      if (dims.arrive) await loadSeqProgressive(base, "arrive", dims.arrive);
+      if (dims.close) { await loadSeqProgressive(base, "close", dims.close); closeReady = true; }
+      if (dims.sweep) await loadSeqFramesConcurrent(base, "sweep", dims.sweep);
+      if (dims.open) await loadSeqProgressive(base, "open", dims.open);
+    })();
   }
 
   function pickDims() {
@@ -1865,10 +1916,16 @@ export function initStory() {
       // one is live, rather than holding both resident indefinitely.
       cache.evictPrefix(oldPrefix);
 
-      if (targetDims.close) loadSeqProgressive(targetBase, "close", targetDims.close, cache, targetPrefix + "close").then(() => { closeReady = true; });
-      if (targetDims.sweep) loadSeqFramesConcurrent(targetBase, "sweep", targetDims.sweep, cache, 5, targetPrefix + "sweep");
-      if (targetDims.arrive) loadSeqProgressive(targetBase, "arrive", targetDims.arrive, cache, targetPrefix + "arrive");
-      if (targetDims.open) loadSeqProgressive(targetBase, "open", targetDims.open, cache, targetPrefix + "open");
+      // Live-site lag fix: sequential viewing-order priority instead of
+      // four simultaneous loaders — see the matching comment in
+      // startLoading() for the full diagnosis (connection/decode
+      // contention across loaders, confirmed against the live site).
+      (async () => {
+        if (targetDims.arrive) await loadSeqProgressive(targetBase, "arrive", targetDims.arrive, cache, targetPrefix + "arrive");
+        if (targetDims.close) { await loadSeqProgressive(targetBase, "close", targetDims.close, cache, targetPrefix + "close"); closeReady = true; }
+        if (targetDims.sweep) await loadSeqFramesConcurrent(targetBase, "sweep", targetDims.sweep, cache, 5, targetPrefix + "sweep");
+        if (targetDims.open) await loadSeqProgressive(targetBase, "open", targetDims.open, cache, targetPrefix + "open");
+      })();
     } finally {
       switchingCamera = false;
       // A resize/rotation that happened WHILE this switch was in flight is
