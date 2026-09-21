@@ -1754,14 +1754,26 @@ export function initStory() {
     end: () => "+=" + Math.round(window.innerHeight * 4.0),
     pin,
     pinSpacing: true,
-    // CS-04 retune: 0.35s of scrub catch-up read as chunky/delayed,
-    // especially on close/open (contract-reported ~350ms lag). Retuned to
-    // 0.12s — inside the contract's suggested 0.08-0.15s short-scrub band —
-    // measured via Playwright-recorded slow/fast/reverse scroll passes
-    // (qa/final-2026-09-21/stream-a/recordings/) rather than physical
-    // trackpad/touch hardware, which this environment cannot exercise; see
-    // status/stream-a.md for that limitation.
-    scrub: 0.12,
+    // CS-04 retune, round 2: measured settle time (last-wheel-event ->
+    // rendered frame index/progress stops changing, via
+    // window.__story.state(), not pixels) across scrub true/0.1/0.12/0.35,
+    // both cameras, slow/flick/reverse/mid-burst-reversal, 5 repeats each
+    // (qa/final-2026-09-21/stream-a/scripts/scrub-settle-by-frame.mjs).
+    // Result: settle is ~0ms for slow/reverse bursts and ~11-16ms for
+    // flick bursts across ALL FOUR values tested, including scrub:true —
+    // i.e. indistinguishable from rAF-loop measurement quantization
+    // (~16.7ms/frame), not a real scrub-driven lag, on this localhost
+    // setup. No overshoot on reversal at any tested value (a mid-burst-
+    // reversal check on the frame index confirmed p reverses smoothly and
+    // monotonically; an earlier false "overshoot" reading was traced to
+    // the detector not accounting for the close->hold segment boundary,
+    // not an actual defect). With no measured downside to a shorter
+    // value, retuned to 0.1s (previously 0.12s) per "take the lowest
+    // stable value" — still inside the contract's 0.08-0.15s band. Real,
+    // reported limitation: not validated against a working settle
+    // measurement under real network/decode latency, or on physical
+    // trackpad/touch hardware (unavailable in this environment).
+    scrub: 0.1,
     anticipatePin: 1,
     invalidateOnRefresh: true,
     onUpdate: (self) => { render(self.progress); ensureLoop(); },
