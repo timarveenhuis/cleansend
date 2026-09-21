@@ -308,16 +308,34 @@ export class StoryGL {
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
   }
 
+  // Gate 3 fix: guards against an ImageBitmap that's been close()'d (its
+  // backing pixel data detached) by the time this actually runs — the
+  // caller-side fix (js/story.js's setLastGood/clearLastGood) prevents
+  // the cache from closing a bitmap that's still in active use, but this
+  // is a second, independent layer: even a caller-side bug or a future
+  // regression should degrade to "skip this upload" rather than throw
+  // ("WebGL: INVALID_VALUE: texImage2D: the ImageBitmap has been
+  // detached", reproduced WebKit-only, intermittent). A detached
+  // ImageBitmap reports width/height 0 per spec; texImage2D is also
+  // wrapped defensively in case an implementation throws instead.
+  // Returns false (upload skipped) or true (uploaded successfully).
   _uploadInto(tex, source) {
     const gl = this.gl;
+    if (!source || !source.width || !source.height) return false;
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    // No UNPACK_FLIP_Y: the vertex shader maps screen-top to v=1 directly
-    // (see VERT), which already matches the source image's row order.
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    try {
+      // No UNPACK_FLIP_Y: the vertex shader maps screen-top to v=1
+      // directly (see VERT), which already matches the source image's
+      // row order.
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    } catch (e) {
+      return false;
+    }
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    return true;
   }
 
   setHoldLayer(name, source) {
@@ -346,7 +364,19 @@ export class StoryGL {
     if (this.frameTexCache.has(bitmap)) return this.frameTexCache.get(bitmap);
     const gl = this.gl;
     const tex = gl.createTexture();
-    this._uploadInto(tex, bitmap);
+    const uploaded = this._uploadInto(tex, bitmap);
+    if (!uploaded) {
+      // Detached/invalid bitmap: don't cache this failed attempt against
+      // the bitmap object (a future, different bitmap reference for the
+      // "same" frame — e.g. after a re-decode — must get a fresh upload
+      // attempt, not silently reuse a failed one forever). Delete the
+      // half-bound scratch texture and fall back to the existing blank
+      // placeholder texture (already valid/initialized elsewhere in this
+      // file) rather than handing callers a texture object with no valid
+      // image data.
+      gl.deleteTexture(tex);
+      return this.sweepPlaceholder;
+    }
     this.frameTexCache.set(bitmap, tex);
     this.frameTexOrder.push(bitmap);
     // keep at most 24 GL textures resident for sequence frames

@@ -22,6 +22,19 @@ import { StoryGL } from "./story-gl.js";
 const gsap = window.gsap;
 const ScrollTrigger = window.ScrollTrigger;
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+// Gate 3 defect #4 (cache-busting): Stream B stamps the release build id
+// on <html data-build="..."> plus ?v= on its own static refs. Every URL
+// THIS module fetches (manifest, hold stills, sequence frames, GL noise
+// textures) goes through decodeOne/decodeOneCapped/the one direct
+// fetch() below, so appending the token there covers all of them from
+// one place rather than touching each call site. Works identically if
+// the attribute is absent (no-op, url returned unchanged) — never
+// required for the engine to function.
+const BUILD_ID = document.documentElement.dataset.build || null;
+function versioned(url) {
+  if (!BUILD_ID) return url;
+  return url + (url.includes("?") ? "&" : "?") + "v=" + encodeURIComponent(BUILD_ID);
+}
 // Gate 1 requirement: diagnostics must never be on by default in
 // production. `window.__story` (test-only state/debug hooks, incl. pixel-
 // accuracy readback) is now only installed when explicitly requested via
@@ -610,7 +623,7 @@ export function initStory() {
 
   async function decodeOne(url) {
     try {
-      const res = await fetch(url);
+      const res = await fetch(versioned(url));
       if (!res.ok) throw new Error(String(res.status));
       const blob = await res.blob();
       return await createImageBitmap(blob);
@@ -626,7 +639,7 @@ export function initStory() {
   // Never upscales: a source already at or below the cap is used as-is.
   async function decodeOneCapped(url, maxW, maxH) {
     try {
-      const res = await fetch(url);
+      const res = await fetch(versioned(url));
       if (!res.ok) throw new Error(String(res.status));
       const blob = await res.blob();
       const full = await createImageBitmap(blob);
@@ -770,7 +783,7 @@ export function initStory() {
     if (loadingStarted) return;
     loadingStarted = true;
     try {
-      const res = await fetch(`${seqBase}/manifest.json`);
+      const res = await fetch(versioned(`${seqBase}/manifest.json`));
       manifest = await res.json();
     } catch (e) {
       loadFailed = true;
