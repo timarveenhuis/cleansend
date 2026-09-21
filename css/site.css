@@ -617,7 +617,9 @@ html:not(.js) .story-stage, html:not(.js) .story-ui { display: none; }
 .site-footer .wordmark { height: 20px; }
 .site-footer small { color: var(--teal-deep); font-size: var(--text-small); }
 .footer-links { display: flex; gap: var(--space-5); }
-.footer-links a { font-size: var(--text-small); color: var(--teal-deep); text-decoration: none; min-height: 44px; display: inline-flex; align-items: center; }
+/* CS-12: min-width added — text-only "Privacy" rendered at 41-43px wide,
+   under the 44px minimum target size (height was already 44px). */
+.footer-links a { font-size: var(--text-small); color: var(--teal-deep); text-decoration: none; min-height: 44px; min-width: 44px; display: inline-flex; align-items: center; justify-content: center; }
 
 /* ============================================================== REVEALS */
 [data-reveal] { opacity: 1; transform: none; }
@@ -870,7 +872,9 @@ html:not(.js) .story-stage, html:not(.js) .story-ui { display: none; }
 @media (max-width: 760px) {
   .site-header { padding: var(--space-2) var(--grid-gutter); }
   .wordmark { height: 20px; }
-  .header-link { padding: var(--space-2) var(--space-3); font-size: 0.75rem; min-height: 40px; }
+  /* CS-12: was min-height:40px, under the 44px minimum target size; measured
+     147x40 via keyboard-traversal audit at 390x844. */
+  .header-link { padding: var(--space-2) var(--space-3); font-size: 0.75rem; min-height: 44px; }
   .hero-grid { padding-block: var(--space-6) var(--space-6); }
   .hero-head h1 .beat { max-width: 12ch; }
   .hero-sub { max-width: 30ch; }
